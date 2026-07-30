@@ -22,7 +22,7 @@ import charset_normalizer
 import requests
 
 from solidlsp.ls_exceptions import InvalidTextLocationError, SolidLSPException
-from solidlsp.ls_types import UnifiedSymbolInformation
+from solidlsp.ls_types import TextEdit, UnifiedSymbolInformation
 from solidlsp.util.subprocess_util import subprocess_run
 
 log = logging.getLogger(__name__)
@@ -332,6 +332,80 @@ class TextUtils:
         """
         text_stepper = TextStepper(text)
         return text_stepper.process_all_gather_lines(with_ends=with_ends)
+
+
+def _strip_line_ending(line: str) -> str:
+    for ending in ("\r\n", "\n", "\r"):
+        if line.endswith(ending):
+            return line[: -len(ending)]
+    return line
+
+
+def apply_text_edits_to_text(text: str, edits: list[TextEdit]) -> str:
+    """
+    Pure function applying a list of LSP `TextEdit`s to a string, returning the resulting string.
+
+    No buffer, no `didChange` notification, no file I/O -- `text` in, resulting text out.
+
+    Positions in `edits` are interpreted as UTF-16 code units, per the LSP default position
+    encoding (a character offset is converted to a code-point offset using the target line's
+    content, so astral characters -- which take two UTF-16 code units -- are handled correctly).
+
+    Edits are assumed non-overlapping, as guaranteed by the LSP `TextEdit[]` contract. When
+    multiple edits share the same start position, the LSP contract requires that the resulting
+    text preserve array order (e.g. two inserts `[A, B]` at the same position must result in "A"
+    appearing before "B"). This is achieved by applying edits in reverse document order, breaking
+    ties (equal start position) by applying the later array index first.
+
+    :param text: the original text
+    :param edits: the list of text edits to apply, as returned by the language server
+    :return: the resulting text; if `edits` is empty, `text` is returned unchanged
+    """
+    if not edits:
+        return text
+
+    lines = TextUtils.split_lines(text, with_ends=True)
+    line_start_indices: list[int] = []
+    offset = 0
+    for line in lines:
+        line_start_indices.append(offset)
+        offset += len(line)
+
+    def to_codepoint_index(line_no: int, utf16_character: int) -> int:
+        if line_no >= len(lines):
+            # position past the last line: LSP's way of addressing the very end of the document
+            return len(text)
+        content = _strip_line_ending(lines[line_no])
+        units = 0
+        for i, ch in enumerate(content):
+            if units == utf16_character:
+                return line_start_indices[line_no] + i
+            units += 2 if ord(ch) > 0xFFFF else 1
+        # utf16_character addresses (or is beyond) the end of the line's content
+        return line_start_indices[line_no] + len(content)
+
+    # resolve every edit's range to absolute code-point indices in the ORIGINAL text, together
+    # with its original array index (needed for the same-position tie-break below)
+    resolved: list[tuple[int, int, int, str]] = []
+    for array_index, edit in enumerate(edits):
+        start = edit["range"]["start"]
+        end = edit["range"]["end"]
+        start_idx = to_codepoint_index(start["line"], start["character"])
+        end_idx = to_codepoint_index(end["line"], end["character"])
+        resolved.append((start_idx, end_idx, array_index, edit["newText"]))
+
+    # Apply in reverse document order (rightmost edit first) so that indices computed against the
+    # original text remain valid for edits not yet applied (they all lie to the left of, or at the
+    # same position as, the edits already applied). Ties (equal start index) are broken by array
+    # index descending, i.e. the LATER array index is applied first -- since it is spliced in
+    # first, an edit applied afterward at the same position is inserted to its left, so the final
+    # text preserves array order (earlier array index ends up appearing first in the result).
+    resolved.sort(key=lambda r: (r[0], r[2]), reverse=True)
+
+    result = text
+    for start_idx, end_idx, _array_index, new_text in resolved:
+        result = result[:start_idx] + new_text + result[end_idx:]
+    return result
 
 
 class PathUtils:

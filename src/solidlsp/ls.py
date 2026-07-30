@@ -42,7 +42,10 @@ from solidlsp.lsp_protocol_handler.lsp_constants import LSPConstants
 from solidlsp.lsp_protocol_handler.lsp_types import (
     Definition,
     DefinitionParams,
+    DocumentFormattingParams,
     DocumentSymbol,
+    ErrorCodes,
+    FormattingOptions,
     ImplementationParams,
     InitializeParams,
     LocationLink,
@@ -76,6 +79,12 @@ mark_used(
 
 _debug_enabled = log.isEnabledFor(logging.DEBUG)
 """Serves as a flag that triggers additional computation when debug logging is enabled."""
+
+FORMATTING_TAB_SIZE = 4
+"""Tab size (in spaces) sent as part of the `options` of a `textDocument/formatting` request."""
+
+FORMATTING_INSERT_SPACES = True
+"""Whether to prefer spaces over tabs, sent as part of the `options` of a `textDocument/formatting` request."""
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -3105,6 +3114,44 @@ class SolidLanguageServer(ABC):
 
         with self.open_file(relative_file_path):
             return self.server.send.rename(params)
+
+    def get_server_capabilities(self) -> dict[str, object] | None:
+        """
+        :return: the `capabilities` dict from the server's `initialize` response, or `None` if
+            no `initialize` response has been observed yet. Pure observation of what was captured
+            centrally in `LanguageServerInterface.send_request`; never raises. Only static
+            capabilities are reflected here -- capabilities registered dynamically via
+            `client/registerCapability` are intentionally not tracked.
+        """
+        return self.server._captured_server_capabilities
+
+    def request_document_formatting(self, relative_file_path: str) -> list[ls_types.TextEdit] | None:
+        """
+        Raise a [textDocument/formatting](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_formatting)
+        request to the Language Server to format the whole given document.
+
+        :param relative_file_path: The relative path of the file to format
+        :return: the list of text edits to apply in order to format the document, verbatim as
+            returned by the server, or None if the server returned no edits
+        :raises SolidLSPException: if the server does not support document formatting (mapped
+            from a `MethodNotFound`, i.e. code -32601, LSP error into an exception whose message
+            contains "does not support textDocument/formatting"); any other error raised while
+            sending the request propagates unchanged.
+        """
+        params = DocumentFormattingParams(
+            textDocument=ls_types.TextDocumentIdentifier(uri=self._resolve_file_uri(relative_file_path)),
+            options=FormattingOptions(tabSize=FORMATTING_TAB_SIZE, insertSpaces=FORMATTING_INSERT_SPACES),
+        )
+
+        try:
+            with self.open_file(relative_file_path):
+                return self.server.send.formatting(params)
+        except SolidLSPException as e:
+            if isinstance(e.cause, LSPError) and e.cause.code == ErrorCodes.MethodNotFound:
+                raise SolidLSPException(
+                    f"The language server does not support textDocument/formatting ({relative_file_path=})", cause=e.cause
+                ) from e.cause
+            raise
 
     def apply_text_edits_to_file(self, relative_path: str, edits: list[ls_types.TextEdit]) -> None:
         """
