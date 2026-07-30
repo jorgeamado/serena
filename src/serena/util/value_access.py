@@ -118,3 +118,66 @@ def classify_member_access(line: str, char_start: int, member_name: str, is_even
 
     # Default: a plain value read (property getter / field read).
     return "read"
+
+
+# --- hover-based symbol-kind detection (for the position-anchored call_hierarchy) -------------
+
+# The fenced C# code block inside an LSP hover markdown value.
+_HOVER_CODE_RE = re.compile(r"```(?:csharp|c#|cs)?[ \t]*\n(.*?)\n```", re.DOTALL | re.IGNORECASE)
+
+MEMBER_HOVER_KINDS = ("event", "property", "field")
+
+
+def classify_hover_symbol(hover_value: str | None) -> tuple[str | None, str]:
+    """
+    Parse an LSP hover markdown value into ``(member_name, kind)`` for a C# symbol, so a
+    position-anchored query can determine what it is pointing at.
+
+    Recognizes the Roslyn hover signature shapes, e.g.
+    ``CancellationToken CancellationTokenSource.Token { get; }`` (property),
+    ``event Action Owner.OnX`` (event), ``void Owner.M(int x)`` (method), ``int Owner.F`` (field).
+
+    :param hover_value: the hover ``contents.value`` markdown (or ``None``).
+    :return: ``(simple member name or None, kind)`` where kind is one of
+        ``"event" | "property" | "field" | "method" | "unknown"``. Never raises.
+    """
+    if not hover_value:
+        return None, "unknown"
+    m = _HOVER_CODE_RE.search(hover_value)
+    signature = (m.group(1) if m else hover_value).strip()
+    if not signature:
+        return None, "unknown"
+    first = signature.splitlines()[0].strip()
+
+    is_event = first.startswith("event ")
+    stripped = first.rstrip()
+    # kind: event -> property (accessor block) -> method (trailing parameter list) -> field.
+    # Using a TRAILING ')' (not any '(') avoids mis-reading a tuple return type like "(int, int) Foo.F".
+    if is_event:
+        kind = "event"
+    elif "{" in first:
+        kind = "property"
+    elif stripped.endswith(")"):
+        kind = "method"
+    else:
+        kind = "field"
+
+    # member name: strip the suffix that belongs to the kind (accessor block / trailing param list),
+    # then take the last '.'-segment's last identifier.
+    head = first[len("event ") :] if is_event else first
+    if kind == "property":
+        head = re.sub(r"\s*\{.*$", "", head)
+    elif kind == "method":
+        lp = head.rfind("(")
+        if lp != -1:
+            head = head[:lp]
+    head = head.strip()
+    name: str | None = None
+    if head:
+        last_segment = head.split(".")[-1].strip()
+        tokens = last_segment.split()
+        if tokens:
+            candidate = re.sub(r"<.*>$", "", tokens[-1])  # drop trailing generic args
+            if re.fullmatch(r"@?[A-Za-z_]\w*", candidate):
+                name = candidate.lstrip("@")
+    return name, kind
