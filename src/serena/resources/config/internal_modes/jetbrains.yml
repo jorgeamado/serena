@@ -12,6 +12,7 @@ excluded_tools:
   - find_implementations
   - get_diagnostics_for_file
   - get_diagnostics_for_symbol
+  - format_file
 included_optional_tools:
   - jet_brains_find_declaration
   - jet_brains_find_implementations
