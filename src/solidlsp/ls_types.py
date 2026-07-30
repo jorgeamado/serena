@@ -423,3 +423,52 @@ class ParameterInformation(TypedDict):
     documentation: NotRequired[MarkupContent | str]
     """ The human-readable doc-comment of this parameter. Will be shown
     in the UI but can be omitted. """
+
+
+class CallHierarchyCallSites(TypedDict):
+    """Represents the call sites where a symbol is called."""
+
+    relative_path: str
+    """ File the ranges point into. """
+    ranges: list[Range]
+    """ The ranges in the file where the symbol is called. """
+
+
+class CallHierarchyNode(TypedDict):
+    """Represents a node in the call hierarchy tree."""
+
+    name: str
+    """ The name of the symbol. """
+    kind: SymbolKind
+    """ The kind of the symbol. """
+    location: Location
+    """ The location of the symbol, derived from the item's selectionRange.start. """
+    detail: NotRequired[str]
+    """ Additional details about the symbol. """
+    call_sites: NotRequired[CallHierarchyCallSites]
+    """ The call sites where this symbol is called. Absent on roots. """
+    recursion: NotRequired[bool]
+    """ Whether this symbol appears in its own ancestors on this path (recursive call). """
+    children: list["CallHierarchyNode"]
+    """ The child nodes in the hierarchy. """
+
+
+class CallHierarchyResult(TypedDict):
+    """Result of a call hierarchy request.
+
+    When the language server does not support call hierarchy, incoming calls are approximated
+    via find-references. Approximate results carry the `approximate` flag and have known limitations:
+    they may include non-call usages (false positives) and may miss callers inside properties,
+    constructors, or one-line functions (false negatives). The `external_calls_omitted` count is
+    a lower bound in approximate mode, as reference normalization silently discards cross-drive
+    and nonexistent external locations before the fallback sees them.
+    """
+
+    roots: list[CallHierarchyNode]
+    """ The root nodes of the call hierarchy. """
+    truncated: bool
+    """ Whether the result was truncated due to node budget or deadline. """
+    external_calls_omitted: int
+    """ Number of external calls that were omitted. In approximate mode, this is a lower bound. """
+    approximate: NotRequired[bool]
+    """ True if the result was derived from find-references instead of native call hierarchy support. """
