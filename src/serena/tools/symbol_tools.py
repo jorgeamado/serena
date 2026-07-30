@@ -24,7 +24,7 @@ from serena.tools import (
 from serena.tools.tools_base import ToolMarkerBeta, ToolMarkerOptional
 from serena.util.ls_diagnostics import GroupedDiagnostics
 from serena.util.text_utils import find_text_coordinates
-from serena.util.value_access import classify_member_access
+from serena.util.value_access import MEMBER_HOVER_KINDS, classify_hover_symbol, classify_member_access
 from solidlsp import ls_types
 from solidlsp.ls_types import SymbolKind
 
@@ -781,11 +781,13 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
 
     def apply(
         self,
-        name_path: str,
-        relative_path: str,
+        name_path: str = "",
+        relative_path: str = "",
         direction: str = "incoming",
         depth: int = 1,
         max_answer_chars: int = -1,
+        line: int = -1,
+        column: int = -1,
     ) -> str:
         """
         Finds callers (incoming) and/or callees (outgoing) of a function or method,
@@ -799,11 +801,19 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
         via single-line syntactic inspection -- results are always approximate, `depth` is treated as 1, and
         "outgoing" is not applicable (see the class docstring for the full list of caveats).
 
-        :param name_path: name path of the symbol
-        :param relative_path: the relative path to the file containing the symbol
+        Alternatively, anchor by POSITION: pass `relative_path` plus 0-based `line` and `column` of any
+        *usage* of a symbol (instead of `name_path`). This reaches property/field/event members that
+        name-path cannot -- including framework/external members like `CancellationTokenSource.Token` that
+        have no source declaration in the project. The kind is detected from the language server's hover;
+        a position that resolves to a method/function returns a message directing you to `name_path`.
+
+        :param name_path: name path of the symbol (omit when anchoring by position)
+        :param relative_path: the relative path to the file containing the symbol (or the usage position)
         :param direction: "incoming" (who calls this), "outgoing" (what this calls), or "both"
         :param depth: maximum depth to expand (1-10); default 1
         :param max_answer_chars: max result length; -1 for default
+        :param line: 0-based line of a usage position to anchor on (requires `column`); -1 = use `name_path`
+        :param column: 0-based column of a usage position to anchor on (requires `line`); -1 = use `name_path`
         :return: JSON with incoming/outgoing call hierarchies
         """
         # validate direction
@@ -817,6 +827,20 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
         # sync file system before any LS call
         if relative_path:
             self.project.ls_sync_file_system_changes()
+
+        # position anchor (relative_path:line:column): resolve the member at a usage position via hover.
+        if line < -1 or column < -1:
+            raise ValueError("line and column must be >= 0 (or -1 to disable position anchoring)")
+        if (line >= 0) != (column >= 0):
+            raise ValueError("line and column must be provided together to anchor by position")
+        if line >= 0 and column >= 0:
+            if not relative_path:
+                raise ValueError("relative_path is required when anchoring by line/column position")
+            if name_path:
+                raise ValueError("provide either name_path or a line/column position, not both")
+            return self._apply_by_position(relative_path, line, column, direction, max_answer_chars)
+        if not name_path:
+            raise ValueError("either name_path, or a position (relative_path + line + column), is required")
 
         # resolve symbol via retriever
         symbol_retriever = self.create_language_server_symbol_retriever()
@@ -966,12 +990,40 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
         apply to members). The F1 "No callable symbol..." string is never returned from this path -- a
         member with zero references still yields a valid synthetic root with `children: []`.
         """
-        member_kind = self._member_kind_name(symbol)
-        member_name = self._member_symbol_name(symbol, resolved_name)
+        return self._render_member(
+            symbol_label=resolved_name,
+            member_kind=self._member_kind_name(symbol),
+            member_name=self._member_symbol_name(symbol, resolved_name),
+            is_event=(symbol.symbol_kind == SymbolKind.Event),
+            member_location=symbol.location,
+            root_relative_path=self._member_location_relative_path(symbol, relative_path),
+            root_line=self._member_location_line(symbol, 0),
+            direction=direction,
+            max_answer_chars=max_answer_chars,
+        )
 
+    def _render_member(
+        self,
+        symbol_label: str,
+        member_kind: str,
+        member_name: str,
+        is_event: bool,
+        member_location: LanguageServerSymbolLocation,
+        root_relative_path: str,
+        root_line: int,
+        direction: str,
+        max_answer_chars: int,
+    ) -> str:
+        """
+        Build the member-specific JSON result (synthetic root + classified reference sites), shared by
+        the name-anchored (`_apply_member`) and position-anchored (`_apply_by_position`) paths. Never
+        uses the `_hierarchy_to_json_list` callable path. `direction == "outgoing"` short-circuits
+        before any reference query; a member with zero references still yields a valid root with
+        `children: []` (the F1 "No callable symbol..." string is never returned here).
+        """
         if direction == "outgoing":
             output: dict[str, object] = {
-                "symbol": resolved_name,
+                "symbol": symbol_label,
                 "direction": "outgoing",
                 "member_kind": member_kind,
                 "outgoing": [],
@@ -979,19 +1031,19 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
             }
             return self._limit_length(self._to_json(output), max_answer_chars)
 
-        # incoming (or both): derive incoming usages from find-references.
         symbol_retriever = self.create_language_server_symbol_retriever()
-        refs = symbol_retriever.find_referencing_symbols_by_location(symbol.location)
+        refs = symbol_retriever.find_referencing_symbols_by_location(member_location)
         root, truncated = self._build_member_incoming_root(
-            symbol=symbol,
-            member_kind=member_kind,
             member_name=member_name,
-            relative_path=relative_path,
+            member_kind=member_kind,
+            is_event=is_event,
+            root_relative_path=root_relative_path,
+            root_line=root_line,
             refs=refs,
         )
 
         output = {
-            "symbol": resolved_name,
+            "symbol": symbol_label,
             "direction": direction,
             "member_kind": member_kind,
             "incoming": [root],
@@ -1015,7 +1067,7 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
             file_counts: dict[str, int] = defaultdict(int)
             self._count_nodes_by_file(cast(list[dict[str, object]], output["incoming"]), file_counts)
             summary: dict[str, object] = {
-                "symbol": resolved_name,
+                "symbol": symbol_label,
                 "direction": direction,
                 "member_kind": member_kind,
                 "approximate": True,
@@ -1032,7 +1084,7 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
             (SPEC §4.4) and drops call_sites/access_kind.
             """
             minimal: dict[str, object] = {
-                "symbol": resolved_name,
+                "symbol": symbol_label,
                 "direction": direction,
                 "member_kind": member_kind,
                 "approximate": True,
@@ -1048,20 +1100,121 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
         result_json = self._to_json(output)
         return self._limit_length(result_json, max_answer_chars, shortened_result_factories=shortened_results)
 
+    def _apply_by_position(self, relative_path: str, line: int, column: int, direction: str, max_answer_chars: int) -> str:
+        """
+        Position-anchored member query: resolve the symbol at ``relative_path:line:column`` via hover,
+        and if it is a property/field/event, classify its references (covers framework/external members
+        such as ``CancellationTokenSource.Token`` that name-path resolution cannot reach). Methods and
+        unresolved positions return a structured message (name-path is the route for callables).
+        """
+        symbol_retriever = self.create_language_server_symbol_retriever()
+        ls = symbol_retriever.get_language_server(relative_path)
+        hover_value = self._extract_hover_value(ls.request_hover(relative_path, line, column))
+
+        name, kind = classify_hover_symbol(hover_value)
+        # Roslyn hover omits the `event` keyword (event vs field is indistinguishable) and cannot flag a
+        # local/type/constant as a non-member. Refine from the declaration's document-symbol kind when the
+        # declaration is in the workspace: "other" means resolved-but-not-a-member (reject); None means no
+        # workspace declaration, so keep the hover kind (e.g. framework members). NOTE: a framework/external
+        # event whose hover lacks `event` and has no workspace declaration is treated as a Field -- its
+        # `+=`/`-=` sites are then classified read_write rather than subscribe/unsubscribe (documented limit).
+        declared = self._declared_member_kind(ls, relative_path, line, column)
+        if declared is not None:
+            kind = declared
+
+        if kind not in MEMBER_HOVER_KINDS or not name:
+            detail = f" ('{name}')" if name else ""
+            return self._to_json(
+                {
+                    "error": f"The symbol at {relative_path}:{line}:{column} resolves to a {kind}{detail}. "
+                    "The position anchor supports property, field, and event members with a resolvable name; "
+                    "for methods/functions (or indexers/unresolved positions) use name_path.",
+                }
+            )
+
+        return self._render_member(
+            symbol_label=name,
+            member_kind=kind.capitalize(),  # property/field/event -> Property/Field/Event
+            member_name=name,
+            is_event=(kind == "event"),
+            member_location=LanguageServerSymbolLocation(relative_path=relative_path, line=line, column=column),
+            root_relative_path=relative_path,
+            root_line=line,
+            direction=direction,
+            max_answer_chars=max_answer_chars,
+        )
+
+    @staticmethod
+    def _extract_hover_value(hover: Any) -> str | None:
+        """Flatten an LSP hover result (MarkupContent dict, plain string, or list of MarkedString) to text."""
+        contents: Any = hover.get("contents") if isinstance(hover, dict) else hover
+        if isinstance(contents, str):
+            return contents
+        if isinstance(contents, dict):
+            value = contents.get("value")
+            return value if isinstance(value, str) else None
+        if isinstance(contents, list):
+            parts: list[str] = []
+            for item in contents:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    value = item.get("value")
+                    if isinstance(value, str):
+                        parts.append(value)
+            return "\n".join(parts) if parts else None
+        return None
+
+    @staticmethod
+    def _declared_member_kind(ls: object, relative_path: str, line: int, column: int) -> str | None:
+        """
+        Resolve the DECLARATION's kind from its document-symbol kind, following textDocument/definition
+        into the workspace. Returns "event"/"property"/"field"/"method" for those kinds, "other" for a
+        workspace declaration that is not one of those (class, local, constant, ...), or None when there is
+        no resolvable workspace declaration (framework/metadata) -- callers then keep the hover kind.
+        """
+        _KIND_NAMES = {
+            SymbolKind.Event: "event",
+            SymbolKind.Property: "property",
+            SymbolKind.Field: "field",
+            SymbolKind.Method: "method",
+            SymbolKind.Function: "method",
+            SymbolKind.Constructor: "method",
+        }
+        try:
+            definitions = ls.request_definition(relative_path, line, column)  # type: ignore[attr-defined]
+        except Exception:
+            return None
+        for d in definitions or []:
+            decl_rel = d.get("relativePath")
+            if not decl_rel:
+                continue
+            decl_start = d.get("range", {}).get("start", {})
+            try:
+                doc_symbols = ls.request_document_symbols(decl_rel)  # type: ignore[attr-defined]
+            except Exception:
+                continue
+            # match the declaration's name range (selectionRange.start) exactly to identify the member.
+            for sym in doc_symbols.iter_symbols():
+                sel = sym.get("selectionRange") or sym.get("location", {}).get("range")
+                sel_start = (sel or {}).get("start", {})
+                if sel_start.get("line") == decl_start.get("line") and sel_start.get("character") == decl_start.get("character"):
+                    return _KIND_NAMES.get(sym.get("kind"), "other")  # resolved but not a member -> reject
+        return None
+
     def _build_member_incoming_root(
         self,
-        symbol: LanguageServerSymbol,
-        member_kind: str,
         member_name: str,
-        relative_path: str,
+        member_kind: str,
+        is_event: bool,
+        root_relative_path: str,
+        root_line: int,
         refs: list[ReferenceInLanguageServerSymbol],
     ) -> tuple[dict[str, object], bool]:
         """
         Build the synthetic member root + grouped/deduped/sorted children (SPEC §4.3, points 2-6).
         :return: (root node dict, truncated flag)
         """
-        is_event = symbol.symbol_kind == SymbolKind.Event
-
         # 1) dedup identical sites (relative_path, line, character); 2) group by containing-symbol identity.
         seen_sites: set[tuple[str, int, int]] = set()
         groups: dict[object, tuple[LanguageServerSymbol, list[tuple[str, int, int]]]] = {}
@@ -1069,7 +1222,7 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
 
         for ref in refs:
             containing = ref.symbol
-            site_rel_path = self._member_location_relative_path(containing, relative_path)
+            site_rel_path = self._member_location_relative_path(containing, root_relative_path)
             site_key = (site_rel_path, ref.line, ref.character)
             if site_key in seen_sites:
                 continue
@@ -1142,8 +1295,8 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
         root: dict[str, object] = {
             "name": member_name,
             "kind": member_kind,
-            "relative_path": self._member_location_relative_path(symbol, relative_path),
-            "line": self._member_location_line(symbol, 0),
+            "relative_path": root_relative_path,
+            "line": root_line,
             "children": children,
         }
         return root, truncated

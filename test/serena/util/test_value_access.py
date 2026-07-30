@@ -57,3 +57,32 @@ _IDS = [row[0] for row in _ROWS]
 def test_classify_member_access(_id: str, line: str, member_name: str, is_event: bool, expected: str, offset: int) -> None:
     char_start = _start(line, member_name) + offset
     assert classify_member_access(line, char_start, member_name, is_event) == expected
+
+
+# --- hover-based symbol-kind detection -------------------------------------------------------
+
+from serena.util.value_access import classify_hover_symbol  # noqa: E402
+
+
+def _fence(sig: str) -> str:
+    return f"```csharp\n{sig}\n```\n  \nSome docs.\n"
+
+
+_HOVER_ROWS = [
+    ("H1", _fence("CancellationToken CancellationTokenSource.Token { get; }"), "Token", "property"),
+    ("H2", _fence("CancellationToken CtrlCHook.Token { get; }"), "Token", "property"),
+    ("H3", _fence("event Action<CharacterUI> CharacterUI.OnDead"), "OnDead", "event"),
+    ("H4", _fence("void Foo.Bar(int x)"), "Bar", "method"),
+    ("H5", _fence("int Foo.Field"), "Field", "field"),
+    ("H6", _fence("(int, int) Foo.Pair { get; set; }"), "Pair", "property"),  # tuple-return property
+    ("H7", "CancellationToken CancellationTokenSource.Token { get; }", "Token", "property"),  # bare, no fence
+    ("H8", None, None, "unknown"),
+    ("H9", "", None, "unknown"),
+]
+_HOVER_IDS = [row[0] for row in _HOVER_ROWS]
+
+
+@pytest.mark.parametrize(("_id", "hover", "expected_name", "expected_kind"), _HOVER_ROWS, ids=_HOVER_IDS)
+def test_classify_hover_symbol(_id: str, hover: str | None, expected_name: str | None, expected_kind: str) -> None:
+    name, kind = classify_hover_symbol(hover)
+    assert (name, kind) == (expected_name, expected_kind)
