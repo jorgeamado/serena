@@ -174,6 +174,15 @@ class LanguageServerInterface(ABC):
         `set_content_modified_retry_methods`.
         """
 
+        self._captured_server_capabilities: dict[str, object] | None = None
+        """
+        The `capabilities` dict from the server's `initialize` response, captured centrally in
+        `send_request` (the single choke point all `initialize` requests pass through, whether
+        issued via the `LanguageServerRequest.initialize` wrapper or directly via
+        `send_request("initialize", ...)`). `None` until an `initialize` response has been
+        observed. Pure observation; never influences the initialize flow itself.
+        """
+
     def set_request_timeout(self, timeout: float | None) -> None:
         """
         :param timeout: the timeout, in seconds, for all requests sent to the language server.
@@ -362,6 +371,8 @@ class LanguageServerInterface(ABC):
         result = self._send_request_once(method, params)
         if not result.is_error():
             log.debug("Returning result:\n%s", result.payload)
+            if method == "initialize" and isinstance(result.payload, dict):
+                self._captured_server_capabilities = result.payload.get("capabilities")
             return result.payload
 
         if method in self._content_modified_retry_methods:
@@ -374,6 +385,8 @@ class LanguageServerInterface(ABC):
                 result = self._send_request_once(method, params)
                 if not result.is_error():
                     log.debug("Returning result:\n%s", result.payload)
+                    if method == "initialize" and isinstance(result.payload, dict):
+                        self._captured_server_capabilities = result.payload.get("capabilities")
                     return result.payload
 
         raise SolidLSPException(f"Error processing request {method} with params:\n{params}", cause=result.error) from result.error

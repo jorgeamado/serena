@@ -12,7 +12,8 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Literal
 
-from serena.tools import SUCCESS_RESULT, EditedFileContext, EditingToolWithDiagnostics, Tool, ToolMarkerOptional
+from serena.tools import SUCCESS_RESULT, EditedFileContext, EditingToolWithDiagnostics, Tool, ToolMarkerBeta, ToolMarkerOptional
+from serena.util.file_proxy import FileProxy
 from serena.util.file_system import scan_directory
 from serena.util.text_utils import (
     ContentReplacer,
@@ -20,7 +21,10 @@ from serena.util.text_utils import (
     MultiFileContentReplacer,
     ReplacementOccurrence,
 )
-from solidlsp.ls_utils import TextUtils
+from solidlsp.ls_exceptions import SolidLSPException
+from solidlsp.ls_utils import TextUtils, apply_text_edits_to_text
+from solidlsp.lsp_protocol_handler.lsp_types import ErrorCodes
+from solidlsp.lsp_protocol_handler.server import LSPError
 
 
 class ReadFileTool(Tool):
@@ -227,6 +231,101 @@ class ReplaceContentTool(EditingToolWithDiagnostics):
                 updated_content = replacer.replace(original_content, needle, repl)
                 context.set_updated_content(updated_content)
             return diagnostics_context.format_result(SUCCESS_RESULT)
+
+
+class FormatFileTool(EditingToolWithDiagnostics, ToolMarkerBeta):
+    """
+    Formats a file using the document-formatting capability of its language server.
+    """
+
+    UNSUPPORTED_MSG = (
+        "The {ls_id} language server does not support document formatting "
+        "(no documentFormattingProvider capability); format_file is unavailable for this file. "
+        "Use an external formatter instead."
+    )
+    NO_CHANGES_MSG = "The language server returned no formatting edits; file unchanged."
+    SUCCESS_MSG_TEMPLATE = "Successfully formatted {relative_path} ({num_edits} edits applied)."
+
+    def apply(self, relative_path: str, max_answer_chars: int = -1) -> str:
+        """
+        Formats the given file as a whole, using the document-formatting capability of the
+        language server that handles it, and writes the result back to disk.
+
+        There is no dry-run mode and no support for formatting only a range; the entire file is
+        reformatted using the language server's own formatting rules. If the language server
+        responsible for the file does not support document formatting (as is the case for all
+        currently supported Python language servers), a message naming the server is returned
+        and the file is left untouched; use an external formatter in that case.
+
+        :param relative_path: the relative path of the file to format
+        :param max_answer_chars: if the output is longer than this, no content will be returned. -1 means the tool determines the limit
+        :return: a message describing the outcome (success with the number of edits applied, no
+            changes were needed, or formatting is unsupported for this file's language server)
+        """
+        with self.DiagnosticsContext(self, relative_path) as diagnostics_context:
+            self.project.ls_sync_file_system_changes()
+            self._validate_path_for_formatting(relative_path)
+
+            symbol_retriever = self.create_language_server_symbol_retriever()
+            ls = symbol_retriever.get_language_server(relative_path)
+
+            # Three-state capability gate: a captured dict without a (truthy-or-{})
+            # `documentFormattingProvider` entry means the server has told us it cannot format;
+            # a captured dict with one present (True or an, possibly empty, options object) means
+            # it can; capabilities never having been captured (None) is UNKNOWN and must not be
+            # treated as unsupported -- the request is attempted regardless.
+            capabilities = ls.get_server_capabilities()
+            if capabilities is not None:
+                formatting_provider = capabilities.get("documentFormattingProvider")
+                if formatting_provider is None or formatting_provider is False:
+                    result = self.UNSUPPORTED_MSG.format(ls_id=ls.ls_id.value)
+                    return self._limit_length(diagnostics_context.format_result(result), max_answer_chars)
+
+            try:
+                edits = ls.request_document_formatting(relative_path)
+            except SolidLSPException as e:
+                if isinstance(e.cause, LSPError) and e.cause.code == ErrorCodes.MethodNotFound:
+                    result = self.UNSUPPORTED_MSG.format(ls_id=ls.ls_id.value)
+                    return self._limit_length(diagnostics_context.format_result(result), max_answer_chars)
+                raise
+
+            if not edits:
+                return self._limit_length(diagnostics_context.format_result(self.NO_CHANGES_MSG), max_answer_chars)
+
+            # Determine whether the edits actually change anything BEFORE opening the standard
+            # write context: `EditedFileContext`'s save-on-exit is unconditional, so entering it
+            # would rewrite the file (touching its mtime) even when the new content is identical.
+            code_editor = self.create_code_editor()
+            original_content = code_editor.read_file(relative_path)
+            updated_content = apply_text_edits_to_text(original_content, edits)
+            # `read_file` returns LF-normalized content and the save step re-applies the project's
+            # configured line ending; keep the result LF-normalized so a server that emits CRLF in
+            # its edits cannot produce doubled carriage returns on write (and so a line-ending-only
+            # edit is correctly recognized as a no-op below).
+            updated_content = updated_content.replace("\r\n", "\n").replace("\r", "\n")
+
+            if updated_content == original_content:
+                return self._limit_length(diagnostics_context.format_result(self.NO_CHANGES_MSG), max_answer_chars)
+
+            with EditedFileContext(relative_path, code_editor) as context:
+                context.set_updated_content(updated_content)
+
+            result = self.SUCCESS_MSG_TEMPLATE.format(relative_path=relative_path, num_edits=len(edits))
+            return self._limit_length(diagnostics_context.format_result(result), max_answer_chars)
+
+    def _validate_path_for_formatting(self, relative_path: str) -> None:
+        """
+        Validates that `relative_path` is a formattable file, raising the same exception types
+        (and mentioning the path, for the identifiable cases) as other editing tools.
+        """
+        if FileProxy.is_external_path(relative_path):
+            raise ValueError(f"Cannot edit external file: {relative_path}")
+        self.project.validate_relative_path(relative_path, require_not_ignored=True)
+        abs_path = os.path.join(self.project.project_root, relative_path)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"File {relative_path} does not exist in the project.")
+        if os.path.isdir(abs_path):
+            raise ValueError(f"Expected a file path, but got a directory path: {relative_path}.")
 
 
 class ReplaceInFilesTool(EditingToolWithDiagnostics):

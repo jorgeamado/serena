@@ -20,6 +20,10 @@ Status of the `main` branch. Changes prior to the next official version change w
 
 * Tools:
   - `find_symbol`: Change tool description to improve tool search results in clients that load tools dynamically
+  - Add `format_file` (beta): formats a whole file via the language server's `textDocument/formatting`
+    capability and writes the result to disk; reports honestly when the routed language server does
+    not support formatting (e.g. all currently supported Python language servers) instead of silently
+    doing nothing
 
 * Language Servers: 
   - Allow language server priorities to be configured in `serena_config.yml` (for auto-detection during 
