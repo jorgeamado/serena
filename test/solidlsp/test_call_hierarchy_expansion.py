@@ -17,10 +17,80 @@ from solidlsp import ls_types
 from solidlsp.ls import (
     CALL_HIERARCHY_DEADLINE_SECONDS,
     CALL_HIERARCHY_MAX_NODES,
+    ReferenceInSymbol,
     SolidLanguageServer,
     SolidLSPException,
 )
+from solidlsp.ls_utils import PathUtils
+from solidlsp.lsp_protocol_handler.lsp_types import SymbolKind
 from solidlsp.lsp_protocol_handler.server import LSPError
+
+
+def _stub_convert_item(item: dict[str, object]) -> tuple[tuple[str, int, int], ls_types.CallHierarchyNode | None, bool]:
+    """Engine-shape converter keyed on (uri, selectionRange.start); no filesystem containment checks.
+
+    Used in place of the real _convert_call_hierarchy_item so unit tests can use fake /repo paths
+    that do not exist on disk (the real converter drops nonexistent paths with omitted=True).
+    """
+    name = cast(str, item.get("name", ""))
+    uri = cast(str, item.get("uri", ""))
+    start = cast(dict[str, int], cast(dict[str, object], item.get("selectionRange", {})).get("start", {}))
+    line = start.get("line", 0)
+    char = start.get("character", 0)
+    abs_path = uri.removeprefix("file://")
+    node: ls_types.CallHierarchyNode = {
+        "name": name,
+        "kind": cast(ls_types.SymbolKind, item.get("kind", 1)),
+        "location": ls_types.Location(
+            uri=uri,
+            range={"start": {"line": line, "character": char}, "end": {"line": line, "character": char + max(len(name), 1)}},
+            absolutePath=abs_path,
+            relativePath=abs_path.removeprefix("/repo/"),
+        ),
+        "children": [],
+    }
+    return ((uri, line, char), node, False)
+
+
+def _make_symbol(
+    name: str, rel_path: str = "a.py", line: int = 0, kind: SymbolKind = SymbolKind.Function
+) -> ls_types.UnifiedSymbolInformation:
+    """Build a UnifiedSymbolInformation with location + selectionRange under the fake /repo root."""
+    return {
+        "children": [],
+        "name": name,
+        "kind": kind,
+        "location": ls_types.Location(
+            uri=f"file:///repo/{rel_path}",
+            range={"start": {"line": line, "character": 0}, "end": {"line": line + 2, "character": 0}},
+            absolutePath=f"/repo/{rel_path}",
+            relativePath=rel_path,
+        ),
+        "selectionRange": {"start": {"line": line, "character": 4}, "end": {"line": line, "character": 4 + len(name)}},
+    }
+
+
+def _wire_fallback_engine(ls: MagicMock) -> None:
+    """Wire the REAL production methods onto the mock (as MagicMock spies with real side effects)
+    so that _call_hierarchy_fallback_incoming / request_call_hierarchy run end-to-end.
+
+    Only request_referencing_symbols / request_containing_symbol / server.send remain scripted stubs,
+    plus _convert_call_hierarchy_item (see _stub_convert_item).
+    """
+    ls._call_hierarchy_fallback_incoming = MagicMock(
+        side_effect=lambda *args, **kwargs: SolidLanguageServer._call_hierarchy_fallback_incoming(ls, *args, **kwargs)
+    )
+    ls._fetch_incoming_calls_via_references = MagicMock(
+        side_effect=lambda item, deadline, max_callers: SolidLanguageServer._fetch_incoming_calls_via_references(
+            ls, item, deadline, max_callers
+        )
+    )
+    ls._expand_call_hierarchy = MagicMock(side_effect=lambda **kwargs: SolidLanguageServer._expand_call_hierarchy(ls, **kwargs))
+    ls._convert_call_hierarchy_item = MagicMock(side_effect=_stub_convert_item)
+    ls._is_unsupported_error = MagicMock(side_effect=lambda e: SolidLanguageServer._is_unsupported_error(ls, e))
+    ls._map_call_hierarchy_exception = MagicMock(
+        side_effect=lambda e, method_name: SolidLanguageServer._map_call_hierarchy_exception(ls, e, method_name)
+    )
 
 
 @pytest.fixture
@@ -33,6 +103,10 @@ def language_server_mock() -> MagicMock:
     ls_id_mock = MagicMock()
     ls_id_mock.value = "test_server"
     ls.ls_id = ls_id_mock
+    # Wire the REAL item converter so fetch/fallback tests drive production conversion code
+    ls._call_hierarchy_item_from_symbol = MagicMock(
+        side_effect=lambda symbol: SolidLanguageServer._call_hierarchy_item_from_symbol(ls, symbol)
+    )
     return ls
 
 
@@ -623,3 +697,584 @@ class TestCallHierarchyExpansion:
         assert len(calls) == 1
         assert calls[0].kwargs["direction"] == "incoming"
         assert calls[0].kwargs["max_nodes"] == 200
+
+
+class TestCallHierarchyItemFromSymbol:
+    """F1: Tests for _call_hierarchy_item_from_symbol conversion."""
+
+    def test_f1_full_symbol_with_location(self, language_server_mock: MagicMock) -> None:
+        """F1a: _call_hierarchy_item_from_symbol converts a full symbol with location."""
+        symbol: ls_types.UnifiedSymbolInformation = {
+            "children": [],
+            "name": "test_func",
+            "kind": SymbolKind.Function,
+            "location": ls_types.Location(
+                uri="file:///repo/test.py",
+                range={"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 10}},
+                absolutePath="/repo/test.py",
+                relativePath="test.py",
+            ),
+            "selectionRange": {"start": {"line": 5, "character": 4}, "end": {"line": 5, "character": 13}},
+        }
+
+        result = SolidLanguageServer._call_hierarchy_item_from_symbol(language_server_mock, symbol)
+
+        assert result is not None
+        assert result["name"] == "test_func"
+        assert result["kind"] == SymbolKind.Function
+        assert result["uri"] == "file:///repo/test.py"
+        assert result["range"] == {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 10}}
+        assert result["selectionRange"] == {"start": {"line": 5, "character": 4}, "end": {"line": 5, "character": 13}}
+        assert result["data"] is None
+
+    def test_f1_symbol_without_location(self, language_server_mock: MagicMock) -> None:
+        """F1b: _call_hierarchy_item_from_symbol returns None for symbol without location."""
+        symbol: ls_types.UnifiedSymbolInformation = {
+            "children": [],
+            "name": "test_var",
+            "kind": SymbolKind.Variable,
+        }
+
+        result = SolidLanguageServer._call_hierarchy_item_from_symbol(language_server_mock, symbol)
+
+        assert result is None
+
+    def test_f1_symbol_without_range(self, language_server_mock: MagicMock) -> None:
+        """F1c: _call_hierarchy_item_from_symbol returns None when location lacks range."""
+        symbol: ls_types.UnifiedSymbolInformation = {
+            "children": [],
+            "name": "test_func",
+            "kind": SymbolKind.Function,
+            "location": ls_types.Location(
+                uri="file:///repo/test.py",
+                range={"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 10}},
+                absolutePath="/repo/test.py",
+                relativePath="test.py",
+            ),
+        }
+        # Deliberately delete range from location after creating it
+        del cast(dict[str, object], symbol["location"])["range"]
+
+        result = SolidLanguageServer._call_hierarchy_item_from_symbol(language_server_mock, symbol)
+
+        assert result is None
+
+
+class TestFallbackFetchGrouping:
+    """F2: Tests for reference-based grouping in _fetch_incoming_calls_via_references."""
+
+    def test_f2_reference_grouping(self, language_server_mock: MagicMock) -> None:
+        """F2: Three references (2 from caller A, 1 from caller B) group into 2 calls."""
+        # Create an item to search references for
+        item: dict[str, object] = {
+            "name": "target_func",
+            "kind": SymbolKind.Function,
+            "uri": "file:///repo/target.py",
+            "selectionRange": {"start": {"line": 10, "character": 4}, "end": {"line": 10, "character": 15}},
+            "range": {"start": {"line": 10, "character": 0}, "end": {"line": 10, "character": 20}},
+            "data": None,
+        }
+
+        # Create mock referencing symbols: 2 in caller_a, 1 in caller_b
+        caller_a_symbol: ls_types.UnifiedSymbolInformation = {
+            "children": [],
+            "name": "caller_a",
+            "kind": SymbolKind.Function,
+            "location": ls_types.Location(
+                uri="file:///repo/callers.py",
+                range={"start": {"line": 20, "character": 0}, "end": {"line": 22, "character": 0}},
+                absolutePath="/repo/callers.py",
+                relativePath="callers.py",
+            ),
+            "selectionRange": {"start": {"line": 20, "character": 4}, "end": {"line": 20, "character": 12}},
+        }
+
+        caller_b_symbol: ls_types.UnifiedSymbolInformation = {
+            "children": [],
+            "name": "caller_b",
+            "kind": SymbolKind.Function,
+            "location": ls_types.Location(
+                uri="file:///repo/callers.py",
+                range={"start": {"line": 25, "character": 0}, "end": {"line": 27, "character": 0}},
+                absolutePath="/repo/callers.py",
+                relativePath="callers.py",
+            ),
+            "selectionRange": {"start": {"line": 25, "character": 4}, "end": {"line": 25, "character": 12}},
+        }
+
+        # Two references in caller_a, one in caller_b
+        mock_references = [
+            ReferenceInSymbol(symbol=caller_a_symbol, line=21, character=5),
+            ReferenceInSymbol(symbol=caller_a_symbol, line=21, character=20),
+            ReferenceInSymbol(symbol=caller_b_symbol, line=26, character=8),
+        ]
+
+        # Mock the language server methods
+        language_server_mock.request_referencing_symbols = MagicMock(return_value=mock_references)
+
+        # Mock request_containing_symbol to return appropriate symbol based on line
+        def mock_containing_symbol(rel_path: str, line: int, char: int, include_body: bool = False) -> ls_types.UnifiedSymbolInformation:
+            if line == 20:
+                return caller_a_symbol
+            elif line == 25:
+                return caller_b_symbol
+            return caller_a_symbol
+
+        language_server_mock.request_containing_symbol = MagicMock(side_effect=mock_containing_symbol)
+
+        # Mock PathUtils methods
+        with (
+            patch.object(PathUtils, "uri_to_path", return_value="/repo/target.py"),
+            patch.object(PathUtils, "get_relative_path", side_effect=lambda path, root: "callers.py"),
+        ):
+            # Call the fetch method with far future deadline and enough budget
+            future_deadline = monotonic() + 1000
+            calls, dropped = SolidLanguageServer._fetch_incoming_calls_via_references(
+                language_server_mock, item, future_deadline, max_callers=100
+            )
+
+        # Should have 2 calls (one per distinct caller)
+        assert len(calls) == 2
+        assert dropped is False
+
+        # Find caller_a and caller_b in results
+        caller_a_call = next((c for c in calls if c["from"]["name"] == "caller_a"), None)
+        caller_b_call = next((c for c in calls if c["from"]["name"] == "caller_b"), None)
+
+        assert caller_a_call is not None
+        assert caller_b_call is not None
+
+        # Caller A should have 2 fromRanges, caller B should have 1
+        assert len(caller_a_call["fromRanges"]) == 2
+        assert len(caller_b_call["fromRanges"]) == 1
+
+        # Verify ranges are zero-width
+        for range_item in cast(list[dict[str, dict[str, int]]], caller_a_call["fromRanges"]):
+            assert range_item["start"]["character"] == range_item["end"]["character"]
+            assert range_item["start"]["line"] == range_item["end"]["line"]
+
+
+class TestFallbackKindFilter:
+    """F3: Tests for kind filtering in _fetch_incoming_calls_via_references."""
+
+    def test_f3_exclude_variable_class_file_kinds(self, language_server_mock: MagicMock) -> None:
+        """F3: References from Variable, Class, File kinds are excluded; Method/Function kept."""
+        item: dict[str, object] = {
+            "name": "target_func",
+            "kind": SymbolKind.Function,
+            "uri": "file:///repo/target.py",
+            "selectionRange": {"start": {"line": 10, "character": 4}, "end": {"line": 10, "character": 15}},
+            "range": {"start": {"line": 10, "character": 0}, "end": {"line": 10, "character": 20}},
+            "data": None,
+        }
+
+        # Create symbols of different kinds
+        method_symbol: ls_types.UnifiedSymbolInformation = {
+            "children": [],
+            "name": "method_caller",
+            "kind": SymbolKind.Method,
+            "location": ls_types.Location(
+                uri="file:///repo/callers.py",
+                range={"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}},
+                absolutePath="/repo/callers.py",
+                relativePath="callers.py",
+            ),
+            "selectionRange": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 17}},
+        }
+
+        function_symbol: ls_types.UnifiedSymbolInformation = {
+            "children": [],
+            "name": "function_caller",
+            "kind": SymbolKind.Function,
+            "location": ls_types.Location(
+                uri="file:///repo/callers.py",
+                range={"start": {"line": 3, "character": 0}, "end": {"line": 5, "character": 0}},
+                absolutePath="/repo/callers.py",
+                relativePath="callers.py",
+            ),
+            "selectionRange": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 19}},
+        }
+
+        variable_symbol: ls_types.UnifiedSymbolInformation = {
+            "children": [],
+            "name": "variable_ref",
+            "kind": SymbolKind.Variable,
+            "location": ls_types.Location(
+                uri="file:///repo/vars.py",
+                range={"start": {"line": 10, "character": 0}, "end": {"line": 10, "character": 5}},
+                absolutePath="/repo/vars.py",
+                relativePath="vars.py",
+            ),
+            "selectionRange": {"start": {"line": 10, "character": 0}, "end": {"line": 10, "character": 5}},
+        }
+
+        class_symbol: ls_types.UnifiedSymbolInformation = {
+            "children": [],
+            "name": "class_ref",
+            "kind": SymbolKind.Class,
+            "location": ls_types.Location(
+                uri="file:///repo/classes.py",
+                range={"start": {"line": 0, "character": 0}, "end": {"line": 10, "character": 0}},
+                absolutePath="/repo/classes.py",
+                relativePath="classes.py",
+            ),
+            "selectionRange": {"start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 15}},
+        }
+
+        file_symbol: ls_types.UnifiedSymbolInformation = {
+            "children": [],
+            "name": "file_ref",
+            "kind": SymbolKind.File,
+            "location": ls_types.Location(
+                uri="file:///repo/modules.py",
+                range={"start": {"line": 0, "character": 0}, "end": {"line": 100, "character": 0}},
+                absolutePath="/repo/modules.py",
+                relativePath="modules.py",
+            ),
+            "selectionRange": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+        }
+
+        # Mock references from all kinds
+        mock_references = [
+            ReferenceInSymbol(symbol=method_symbol, line=0, character=10),
+            ReferenceInSymbol(symbol=function_symbol, line=4, character=5),
+            ReferenceInSymbol(symbol=variable_symbol, line=10, character=0),
+            ReferenceInSymbol(symbol=class_symbol, line=5, character=0),
+            ReferenceInSymbol(symbol=file_symbol, line=50, character=0),
+        ]
+
+        language_server_mock.request_referencing_symbols = MagicMock(return_value=mock_references)
+
+        def mock_containing_by_path(rel_path: str, *args, **kw) -> ls_types.UnifiedSymbolInformation:
+            if rel_path == "callers.py":
+                return method_symbol if args[0] == 0 else function_symbol
+            elif rel_path == "vars.py":
+                return variable_symbol
+            elif rel_path == "classes.py":
+                return class_symbol
+            elif rel_path == "modules.py":
+                return file_symbol
+            return method_symbol
+
+        language_server_mock.request_containing_symbol = MagicMock(side_effect=mock_containing_by_path)
+
+        # Mock PathUtils to route to different files based on the symbol's location
+        def mock_uri_to_path(uri: str) -> str:
+            uri_to_path_map = {
+                "file:///repo/callers.py": "/repo/callers.py",
+                "file:///repo/vars.py": "/repo/vars.py",
+                "file:///repo/classes.py": "/repo/classes.py",
+                "file:///repo/modules.py": "/repo/modules.py",
+            }
+            return uri_to_path_map.get(uri, "/repo/target.py")
+
+        def mock_get_rel_path(abs_path: str, root: str) -> str:
+            return abs_path.split("/")[-1]
+
+        with (
+            patch.object(PathUtils, "uri_to_path", side_effect=mock_uri_to_path),
+            patch.object(PathUtils, "get_relative_path", side_effect=mock_get_rel_path),
+        ):
+            future_deadline = monotonic() + 1000
+            calls, dropped = SolidLanguageServer._fetch_incoming_calls_via_references(
+                language_server_mock, item, future_deadline, max_callers=100
+            )
+
+        # Only method and function should be included (2 calls total)
+        assert len(calls) == 2
+        caller_names = {c["from"]["name"] for c in calls}
+        assert caller_names == {"method_caller", "function_caller"}
+
+
+class TestApproximateFlag:
+    """F4: fallback-activated result vs exact result — the approximate flag."""
+
+    def test_f4_fallback_result_has_approximate_true(self, language_server_mock: MagicMock) -> None:
+        """F4a: driving the REAL _call_hierarchy_fallback_incoming yields approximate=True with the derived callers."""
+        _wire_fallback_engine(language_server_mock)
+
+        leaf_symbol = _make_symbol("leaf", rel_path="a.py", line=0)
+        mid_symbol = _make_symbol("mid", rel_path="a.py", line=10)
+
+        language_server_mock.request_containing_symbol = MagicMock(return_value=leaf_symbol)
+        language_server_mock.request_referencing_symbols = MagicMock(
+            return_value=[ReferenceInSymbol(symbol=mid_symbol, line=11, character=8)]
+        )
+
+        result = SolidLanguageServer._call_hierarchy_fallback_incoming(
+            language_server_mock, "a.py", 0, 4, depth=1, max_nodes=200, deadline=monotonic() + 1000
+        )
+
+        # production code was actually driven: root resolved, references fetched, tree expanded
+        assert result["approximate"] is True
+        assert [root["name"] for root in result["roots"]] == ["leaf"]
+        assert [child["name"] for child in result["roots"][0]["children"]] == ["mid"]
+        language_server_mock.request_referencing_symbols.assert_called_once()
+
+    def test_f4_empty_fallback_result_still_approximate(self, language_server_mock: MagicMock) -> None:
+        """F4b: a fallback whose root is not a Method/Function returns EMPTY roots but still approximate=True."""
+        _wire_fallback_engine(language_server_mock)
+
+        variable_symbol = _make_symbol("module_var", rel_path="a.py", line=0, kind=SymbolKind.Variable)
+        language_server_mock.request_containing_symbol = MagicMock(return_value=variable_symbol)
+        language_server_mock.request_referencing_symbols = MagicMock(return_value=[])
+
+        result = SolidLanguageServer._call_hierarchy_fallback_incoming(
+            language_server_mock, "a.py", 0, 4, depth=1, max_nodes=200, deadline=monotonic() + 1000
+        )
+
+        assert result["roots"] == []
+        assert result["approximate"] is True
+        # a rejected root never triggers a reference search
+        language_server_mock.request_referencing_symbols.assert_not_called()
+
+    def test_f4_exact_result_no_approximate_key(self, language_server_mock: MagicMock) -> None:
+        """F4c: request_call_hierarchy with a WORKING scripted prepare yields a result with NO approximate key."""
+        _wire_fallback_engine(language_server_mock)
+        language_server_mock.server_started = True
+        language_server_mock.server = MagicMock()
+
+        leaf_item = SolidLanguageServer._call_hierarchy_item_from_symbol(language_server_mock, _make_symbol("leaf"))
+        assert leaf_item is not None
+        language_server_mock.server.send.prepare_call_hierarchy = MagicMock(return_value=[leaf_item])
+        language_server_mock.server.send.incoming_calls = MagicMock(return_value=[])
+
+        result = SolidLanguageServer.request_call_hierarchy(
+            language_server_mock, "a.py", 0, 4, direction="incoming", depth=1, max_nodes=200
+        )
+
+        assert [root["name"] for root in result["roots"]] == ["leaf"]
+        assert "approximate" not in result
+        # the exact path never touched the fallback machinery
+        language_server_mock._call_hierarchy_fallback_incoming.assert_not_called()
+        language_server_mock._fetch_incoming_calls_via_references.assert_not_called()
+
+
+class TestSelfRecursiveViaFallback:
+    """F5: self-recursive caller through the fallback fetch — engine recursion stub in the RESULT tree."""
+
+    def test_f5_self_recursive_caller(self, language_server_mock: MagicMock) -> None:
+        """F5: references that make the root its own caller produce a node with recursion=True in the result."""
+        _wire_fallback_engine(language_server_mock)
+
+        recursive_symbol = _make_symbol("recursive_fn", rel_path="recursive.py", line=0)
+
+        language_server_mock.request_containing_symbol = MagicMock(return_value=recursive_symbol)
+        # the only reference to recursive_fn lies INSIDE recursive_fn itself (self-call)
+        language_server_mock.request_referencing_symbols = MagicMock(
+            return_value=[ReferenceInSymbol(symbol=recursive_symbol, line=2, character=8)]
+        )
+
+        result = SolidLanguageServer._call_hierarchy_fallback_incoming(
+            language_server_mock, "recursive.py", 0, 4, depth=2, max_nodes=200, deadline=monotonic() + 1000
+        )
+
+        assert result["approximate"] is True
+        assert [root["name"] for root in result["roots"]] == ["recursive_fn"]
+
+        # the engine (unchanged by the fallback) must emit a recursion stub for the self-cycle
+        children = result["roots"][0]["children"]
+        assert [child["name"] for child in children] == ["recursive_fn"]
+        stub = children[0]
+        assert stub.get("recursion") is True
+        assert stub["children"] == []
+
+
+class TestFallbackDeadlineAndMaxCallers:
+    """F11: Tests for deadline and max_callers bounds in _fetch_incoming_calls_via_references."""
+
+    def test_f11_pre_expired_deadline(self, language_server_mock: MagicMock) -> None:
+        """F11a: Pre-expired deadline yields 0 calls + dropped=True."""
+        item: dict[str, object] = {
+            "name": "target",
+            "kind": SymbolKind.Function,
+            "uri": "file:///repo/target.py",
+            "selectionRange": {"start": {"line": 10, "character": 0}, "end": {"line": 10, "character": 6}},
+            "range": {"start": {"line": 10, "character": 0}, "end": {"line": 10, "character": 6}},
+            "data": None,
+        }
+
+        # Even if we have references, a past deadline should stop processing immediately
+        caller_symbol: ls_types.UnifiedSymbolInformation = {
+            "children": [],
+            "name": "caller",
+            "kind": SymbolKind.Function,
+            "location": ls_types.Location(
+                uri="file:///repo/callers.py",
+                range={"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}},
+                absolutePath="/repo/callers.py",
+                relativePath="callers.py",
+            ),
+            "selectionRange": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 10}},
+        }
+
+        mock_references = [ReferenceInSymbol(symbol=caller_symbol, line=1, character=5)]
+
+        language_server_mock.request_referencing_symbols = MagicMock(return_value=mock_references)
+        language_server_mock.request_containing_symbol = MagicMock(return_value=caller_symbol)
+
+        past_deadline = monotonic() - 1  # Already expired
+        calls, dropped = SolidLanguageServer._fetch_incoming_calls_via_references(
+            language_server_mock, item, past_deadline, max_callers=100
+        )
+
+        assert len(calls) == 0
+        assert dropped is True
+
+    def test_f11_max_callers_exceeded(self, language_server_mock: MagicMock) -> None:
+        """F11b: max_callers=1 with 3 available callers yields 1 caller + dropped=True."""
+        item: dict[str, object] = {
+            "name": "target",
+            "kind": SymbolKind.Function,
+            "uri": "file:///repo/target.py",
+            "selectionRange": {"start": {"line": 10, "character": 0}, "end": {"line": 10, "character": 6}},
+            "range": {"start": {"line": 10, "character": 0}, "end": {"line": 10, "character": 6}},
+            "data": None,
+        }
+
+        # Create 3 distinct callers
+        callers = []
+        for i in range(3):
+            caller: ls_types.UnifiedSymbolInformation = {
+                "children": [],
+                "name": f"caller_{i}",
+                "kind": SymbolKind.Function,
+                "location": ls_types.Location(
+                    uri="file:///repo/callers.py",
+                    range={"start": {"line": i * 5, "character": 0}, "end": {"line": i * 5 + 2, "character": 0}},
+                    absolutePath="/repo/callers.py",
+                    relativePath="callers.py",
+                ),
+                "selectionRange": {"start": {"line": i * 5, "character": 4}, "end": {"line": i * 5, "character": 12}},
+            }
+            callers.append(caller)
+
+        mock_references = [
+            ReferenceInSymbol(symbol=callers[0], line=1, character=5),
+            ReferenceInSymbol(symbol=callers[1], line=6, character=5),
+            ReferenceInSymbol(symbol=callers[2], line=11, character=5),
+        ]
+
+        language_server_mock.request_referencing_symbols = MagicMock(return_value=mock_references)
+        language_server_mock.request_containing_symbol = MagicMock(side_effect=lambda *args, **kw: callers[args[1] // 5])
+
+        future_deadline = monotonic() + 1000
+        calls, dropped = SolidLanguageServer._fetch_incoming_calls_via_references(
+            language_server_mock, item, future_deadline, max_callers=1
+        )
+
+        # Should have 1 caller and dropped=True
+        assert len(calls) == 1
+        assert dropped is True
+
+    def test_f11_truncated_flag_propagation(self, language_server_mock: MagicMock) -> None:
+        """F11c: a dropped=True fetch inside the REAL fallback wrapper yields truncated=True in the final result,
+        and the second fetch receives the REMAINING budget (a smaller max_callers than the first).
+        """
+        _wire_fallback_engine(language_server_mock)
+
+        # call graph: target <- {caller_a, caller_b}; caller_a <- {caller_c, caller_d}
+        target = _make_symbol("target", rel_path="a.py", line=0)
+        caller_a = _make_symbol("caller_a", rel_path="a.py", line=10)
+        caller_b = _make_symbol("caller_b", rel_path="a.py", line=20)
+        caller_c = _make_symbol("caller_c", rel_path="a.py", line=30)
+        caller_d = _make_symbol("caller_d", rel_path="a.py", line=40)
+
+        def references_for(rel_path: str, line: int, column: int, **kwargs: object) -> list[ReferenceInSymbol]:
+            if line == 0:  # target: two callers, fits within the first fetch's budget
+                return [
+                    ReferenceInSymbol(symbol=caller_a, line=11, character=8),
+                    ReferenceInSymbol(symbol=caller_b, line=21, character=8),
+                ]
+            if line == 10:  # caller_a: TWO more callers, but only budget for one -> dropped=True
+                return [
+                    ReferenceInSymbol(symbol=caller_c, line=31, character=8),
+                    ReferenceInSymbol(symbol=caller_d, line=41, character=8),
+                ]
+            return []
+
+        language_server_mock.request_containing_symbol = MagicMock(return_value=target)
+        language_server_mock.request_referencing_symbols = MagicMock(side_effect=references_for)
+
+        # max_nodes=4: root(1) + 2 children = 3 handed out after the first fetch,
+        # so the second fetch gets remaining budget 1 while 2 callers are available -> dropped=True
+        result = SolidLanguageServer._call_hierarchy_fallback_incoming(
+            language_server_mock, "a.py", 0, 4, depth=2, max_nodes=4, deadline=monotonic() + 1000
+        )
+
+        # the dropped flag from the bounded fetch must surface as truncated=True on the final result
+        assert result["truncated"] is True
+        assert result["approximate"] is True
+
+        # the remaining-budget contract: the wrapper passes max_nodes minus nodes handed out so far,
+        # so the second fetch call must receive a strictly smaller max_callers than the first
+        fetch_calls = language_server_mock._fetch_incoming_calls_via_references.call_args_list
+        assert len(fetch_calls) >= 2
+        first_max_callers = fetch_calls[0].args[2]
+        second_max_callers = fetch_calls[1].args[2]
+        assert first_max_callers == 3  # max_nodes(4) - root(1)
+        assert second_max_callers == 1  # max_nodes(4) - root(1) - 2 callers handed out
+        assert second_max_callers < first_max_callers
+
+        # tree shape sanity: caller_a expanded with exactly one (budget-capped) grandchild
+        root = result["roots"][0]
+        assert [child["name"] for child in root["children"]] == ["caller_a", "caller_b"]
+        caller_a_node = root["children"][0]
+        assert [child["name"] for child in caller_a_node["children"]] == ["caller_c"]
+
+
+class TestErrorPropagation:
+    """F12-F13: error propagation through request_call_hierarchy (fallback NOT activated)."""
+
+    @staticmethod
+    def _wire_request_path(ls: MagicMock) -> None:
+        """Wire the real engine and a scripted server transport for driving request_call_hierarchy."""
+        _wire_fallback_engine(ls)
+        ls.server_started = True
+        ls.server = MagicMock()
+
+    def test_f12_32601_from_incoming_calls_after_prepare(self, language_server_mock: MagicMock) -> None:
+        """F12: -32601 from incoming_calls AFTER a successful prepare propagates as the unsupported error;
+        the fallback is NOT activated.
+        """
+        self._wire_request_path(language_server_mock)
+
+        leaf_item = SolidLanguageServer._call_hierarchy_item_from_symbol(language_server_mock, _make_symbol("leaf"))
+        assert leaf_item is not None
+        language_server_mock.server.send.prepare_call_hierarchy = MagicMock(return_value=[leaf_item])
+        language_server_mock.server.send.incoming_calls = MagicMock(
+            side_effect=SolidLSPException(
+                "Error processing request callHierarchy/incomingCalls", cause=LSPError(-32601, "method not found")
+            )
+        )
+
+        with pytest.raises(SolidLSPException, match="does not support call hierarchy") as excinfo:
+            SolidLanguageServer.request_call_hierarchy(language_server_mock, "a.py", 0, 4, direction="incoming", depth=1, max_nodes=200)
+
+        # the message names the ACTUAL failed method (incomingCalls, after a successful prepare)
+        assert "callHierarchy/incomingCalls" in str(excinfo.value)
+
+        # fallback NOT activated: no reference search, no fallback entry point, no containing-symbol resolution
+        language_server_mock._call_hierarchy_fallback_incoming.assert_not_called()
+        language_server_mock.request_referencing_symbols.assert_not_called()
+        language_server_mock.request_containing_symbol.assert_not_called()
+
+    def test_f13_non_32601_prepare_failure(self, language_server_mock: MagicMock) -> None:
+        """F13: a non--32601 prepare failure (cause code -32603) propagates unchanged; fallback NOT activated."""
+        self._wire_request_path(language_server_mock)
+
+        original = SolidLSPException("Error processing request textDocument/prepareCallHierarchy", cause=LSPError(-32603, "internal error"))
+        language_server_mock.server.send.prepare_call_hierarchy = MagicMock(side_effect=original)
+
+        with pytest.raises(SolidLSPException) as excinfo:
+            SolidLanguageServer.request_call_hierarchy(language_server_mock, "a.py", 0, 4, direction="incoming", depth=1, max_nodes=200)
+
+        # the ORIGINAL error propagates -- it is not remapped to the unsupported message
+        assert excinfo.value is original
+        assert "does not support call hierarchy" not in str(excinfo.value)
+
+        # fallback NOT activated
+        language_server_mock._call_hierarchy_fallback_incoming.assert_not_called()
+        language_server_mock.request_referencing_symbols.assert_not_called()
+        language_server_mock.request_containing_symbol.assert_not_called()
+        language_server_mock.server.send.incoming_calls.assert_not_called()
