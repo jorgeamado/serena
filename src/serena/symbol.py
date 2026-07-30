@@ -877,6 +877,50 @@ class LanguageServerSymbolRetriever:
 
         return [ReferenceInLanguageServerSymbol.from_lsp_reference(r) for r in references]
 
+    def request_call_hierarchy(
+        self, name_path: str, relative_file_path: str, direction: str, depth: int, max_nodes: int
+    ) -> "ls_types.CallHierarchyResult":
+        """
+        Request call hierarchy for a symbol, expanding transitively.
+
+        :param name_path: the name path of the symbol to find. (While this can be a matching pattern, it should
+            usually be the full path to ensure uniqueness.)
+        :param relative_file_path: the relative path of the file in which the symbol is defined.
+        :param direction: "incoming" | "outgoing" (a single direction; "both" is composed at the tool layer)
+        :param depth: the maximum depth to expand the hierarchy
+        :param max_nodes: the maximum number of nodes to emit
+        :return: CallHierarchyResult containing the hierarchy tree
+        """
+        symbol = self.find_unique(name_path, substring_matching=False, within_relative_path=relative_file_path)
+        return self.request_call_hierarchy_by_location(symbol.location, direction=direction, depth=depth, max_nodes=max_nodes)
+
+    def request_call_hierarchy_by_location(
+        self, symbol_location: LanguageServerSymbolLocation, direction: str, depth: int, max_nodes: int
+    ) -> "ls_types.CallHierarchyResult":
+        """
+        Request call hierarchy for a symbol at a given location, expanding transitively.
+
+        :param symbol_location: the location of the symbol for which to request the call hierarchy.
+        :param direction: "incoming" | "outgoing" (a single direction; "both" is composed at the tool layer)
+        :param depth: the maximum depth to expand the hierarchy
+        :param max_nodes: the maximum number of nodes to emit
+        :return: CallHierarchyResult containing the hierarchy tree
+        """
+        if not symbol_location.has_position_in_file():
+            raise ValueError("Symbol location does not contain a valid position in a file")
+        assert symbol_location.relative_path is not None
+        assert symbol_location.line is not None
+        assert symbol_location.column is not None
+        lang_server = self.get_language_server(symbol_location.relative_path)
+        return lang_server.request_call_hierarchy(
+            relative_file_path=symbol_location.relative_path,
+            line=symbol_location.line,
+            column=symbol_location.column,
+            direction=direction,
+            depth=depth,
+            max_nodes=max_nodes,
+        )
+
     def find_implementing_symbols(
         self,
         name_path: str,

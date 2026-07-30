@@ -90,6 +90,7 @@ class BasedPyrightLanguageServer(SolidLanguageServer):
                     },
                     "definition": {"dynamicRegistration": True},
                     "references": {"dynamicRegistration": True},
+                    "callHierarchy": {"dynamicRegistration": False},
                     "documentSymbol": {
                         "dynamicRegistration": True,
                         "symbolKind": {"valueSet": list(range(1, 27))},

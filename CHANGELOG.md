@@ -19,6 +19,7 @@ Status of the `main` branch. Changes prior to the next official version change w
     removed in v1.0.0 #1773
 
 * Tools:
+  - Add `call_hierarchy`: find callers/callees transitively using the language server's call hierarchy
   - `find_symbol`: Change tool description to improve tool search results in clients that load tools dynamically
 
 * Language Servers: 
