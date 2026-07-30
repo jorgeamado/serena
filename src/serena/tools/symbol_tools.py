@@ -5,10 +5,15 @@ Language server-related tools
 import copy
 import os
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
-from serena.symbol import LanguageServerSymbol, LanguageServerSymbolDictGrouper
+from serena.symbol import (
+    LanguageServerSymbol,
+    LanguageServerSymbolDictGrouper,
+    LanguageServerSymbolLocation,
+    ReferenceInLanguageServerSymbol,
+)
 from serena.tools import (
     SUCCESS_RESULT,
     EditingToolWithDiagnostics,
@@ -19,6 +24,7 @@ from serena.tools import (
 from serena.tools.tools_base import ToolMarkerBeta, ToolMarkerOptional
 from serena.util.ls_diagnostics import GroupedDiagnostics
 from serena.util.text_utils import find_text_coordinates
+from serena.util.value_access import classify_member_access
 from solidlsp import ls_types
 from solidlsp.ls_types import SymbolKind
 
@@ -739,10 +745,38 @@ class SafeDeleteSymbol(Tool, ToolMarkerSymbolicEdit):
         return SUCCESS_RESULT
 
 
+# Member (property/field/event) path constants -- SPEC-call-hierarchy-members.md (Rev 2).
+# Kinds routed to the member path instead of the callable call-hierarchy/find-references-fallback path.
+MEMBER_KINDS = {SymbolKind.Property, SymbolKind.Field, SymbolKind.Event}
+# Node budget for member incoming children (SPEC §4.3.5); mirrors CALL_HIERARCHY_MAX_NODES for callables.
+MEMBER_MAX_NODES = 200
+# Frozen note text (SPEC §7, F2). Member incoming results are always approximate; this note explains why.
+MEMBER_APPROXIMATE_NOTE = (
+    "incoming usages for this property, field, or event were derived from find-references and "
+    "classified by access kind syntactically; results are approximate and may include non-access "
+    "usages or 'unknown' where a site could not be classified."
+)
+# Frozen note text (SPEC §7, F3). Outgoing calls make no sense for a property/field/event.
+MEMBER_OUTGOING_UNAVAILABLE = "outgoing calls are not applicable to a property, field, or event"
+
+
 class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
     """
     Finds callers (incoming) and/or callees (outgoing) of a function or method,
     transitively up to a given depth, using the language server's call hierarchy.
+
+    Also supports properties, fields, and events (SPEC-call-hierarchy-members.md, Rev 2): for these
+    "member" kinds, incoming usages are derived from find-references (there is no accessor-level call
+    hierarchy) and each usage site is classified into an access kind (read/write/read_write/subscribe/
+    unsubscribe/invoke/unknown) by syntactically inspecting the source line. This member path is
+    reference-based and single-line syntactic, so its results are always reported as approximate, and
+    sites that cannot be classified confidently are "unknown" rather than guessed. Treating a plain
+    read as "get" and a plain write as "set" is a heuristic, not an identity: a ref-returning property
+    getter can expose storage that callers mutate without ever calling a setter, and such a site would
+    still read as a "read" here. Multi-line expressions, comments interleaved in tokens, deconstruction
+    targets, indexers, `&addr`/`__makeref`, and delegate copies of events are not modeled. Member mode
+    is depth-1 only (transitively expanding a member is not semantically sound: reads/writes of a
+    wrapping member do not both execute the inner access), and outgoing calls do not apply to members.
     """
 
     def apply(
@@ -758,6 +792,12 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
         transitively up to a given depth, using the language server's call hierarchy.
         When the language server does not support call hierarchy, incoming calls are automatically derived from find-references,
         which may include non-call usages and may miss callers inside properties, constructors, or one-line functions.
+
+        If `name_path` resolves to a property, field, or event, a separate "member" path is used instead
+        (SPEC-call-hierarchy-members.md, Rev 2): incoming usages are derived from find-references and each
+        usage site is classified by access kind (read/write/read_write/subscribe/unsubscribe/invoke/unknown)
+        via single-line syntactic inspection -- results are always approximate, `depth` is treated as 1, and
+        "outgoing" is not applicable (see the class docstring for the full list of caveats).
 
         :param name_path: name path of the symbol
         :param relative_path: the relative path to the file containing the symbol
@@ -782,6 +822,12 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
         symbol_retriever = self.create_language_server_symbol_retriever()
         symbol = symbol_retriever.find_unique(name_path, substring_matching=False, within_relative_path=relative_path)
         resolved_name = symbol.get_name_path()
+
+        # member path (property/field/event): early, member-specific branch. The callable code below
+        # (call-hierarchy requests, F1 empty-check, _hierarchy_to_json_list) is not entered for members
+        # and is left byte-for-byte unchanged (SPEC-call-hierarchy-members.md Rev 2, §4.1).
+        if symbol.symbol_kind in MEMBER_KINDS:
+            return self._apply_member(symbol, resolved_name, relative_path, direction, max_answer_chars)
 
         # request call hierarchy
         max_nodes_per_direction = 200  # CALL_HIERARCHY_MAX_NODES
@@ -901,6 +947,279 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
 
         result_json = self._to_json(output)
         return self._limit_length(result_json, max_answer_chars, shortened_result_factories=shortened_results)
+
+    def _apply_member(
+        self,
+        symbol: LanguageServerSymbol,
+        resolved_name: str,
+        relative_path: str,
+        direction: str,
+        max_answer_chars: int,
+    ) -> str:
+        """
+        Member (property/field/event) path -- SPEC-call-hierarchy-members.md (Rev 2) §4.2/§4.3.
+
+        Produces a member-specific JSON shape (NOT `_hierarchy_to_json_list`): a synthetic root node for
+        the queried member itself, whose children are the (grouped, deduped, deterministically sorted)
+        referencing symbols, each carrying `call_sites` with a syntactically classified `access_kind` per
+        site. `direction == "outgoing"` short-circuits before any reference query (outgoing calls do not
+        apply to members). The F1 "No callable symbol..." string is never returned from this path -- a
+        member with zero references still yields a valid synthetic root with `children: []`.
+        """
+        member_kind = self._member_kind_name(symbol)
+        member_name = self._member_symbol_name(symbol, resolved_name)
+
+        if direction == "outgoing":
+            output: dict[str, object] = {
+                "symbol": resolved_name,
+                "direction": "outgoing",
+                "member_kind": member_kind,
+                "outgoing": [],
+                "outgoing_unavailable": MEMBER_OUTGOING_UNAVAILABLE,
+            }
+            return self._limit_length(self._to_json(output), max_answer_chars)
+
+        # incoming (or both): derive incoming usages from find-references.
+        symbol_retriever = self.create_language_server_symbol_retriever()
+        refs = symbol_retriever.find_referencing_symbols_by_location(symbol.location)
+        root, truncated = self._build_member_incoming_root(
+            symbol=symbol,
+            member_kind=member_kind,
+            member_name=member_name,
+            relative_path=relative_path,
+            refs=refs,
+        )
+
+        output = {
+            "symbol": resolved_name,
+            "direction": direction,
+            "member_kind": member_kind,
+            "incoming": [root],
+            "approximate": True,
+            "approximate_note": MEMBER_APPROXIMATE_NOTE,
+            "truncated": truncated,
+            "external_calls_omitted": 0,  # find_referencing_symbols_by_location exposes no drop count
+        }
+        if direction == "both":
+            output["outgoing"] = []
+            output["outgoing_unavailable"] = MEMBER_OUTGOING_UNAVAILABLE
+
+        def make_tree_without_call_sites() -> str:
+            """Tree without call_sites for the member root (drops per-site access_kind)."""
+            result_copy = copy.deepcopy(output)
+            self._remove_call_sites(cast(list[dict[str, object]], result_copy["incoming"]))
+            return f"Call hierarchy (without call site details):\n{self._to_json(result_copy)}"
+
+        def make_per_file_counts() -> str:
+            """Per-file counts of incoming member usages."""
+            file_counts: dict[str, int] = defaultdict(int)
+            self._count_nodes_by_file(cast(list[dict[str, object]], output["incoming"]), file_counts)
+            summary: dict[str, object] = {
+                "symbol": resolved_name,
+                "direction": direction,
+                "member_kind": member_kind,
+                "approximate": True,
+                "approximate_note": MEMBER_APPROXIMATE_NOTE,
+            }
+            if file_counts:
+                summary["incoming"] = dict(file_counts)
+            if "outgoing_unavailable" in output:
+                summary["outgoing_unavailable"] = output["outgoing_unavailable"]
+            return f"Call hierarchy summary (counts per file):\n{self._to_json(summary)}"
+
+        def make_minimal() -> str:
+            """Smallest fallback: minimal JSON that STILL carries member_kind/approximate/approximate_note
+            (SPEC §4.4) and drops call_sites/access_kind.
+            """
+            minimal: dict[str, object] = {
+                "symbol": resolved_name,
+                "direction": direction,
+                "member_kind": member_kind,
+                "approximate": True,
+                "approximate_note": MEMBER_APPROXIMATE_NOTE,
+                "incoming_usage_count": len(cast(list[object], root["children"])),
+                "truncated": truncated,
+            }
+            if "outgoing_unavailable" in output:
+                minimal["outgoing_unavailable"] = output["outgoing_unavailable"]
+            return self._to_json(minimal)
+
+        shortened_results: list[Callable[[], str]] = [make_tree_without_call_sites, make_per_file_counts, make_minimal]
+        result_json = self._to_json(output)
+        return self._limit_length(result_json, max_answer_chars, shortened_result_factories=shortened_results)
+
+    def _build_member_incoming_root(
+        self,
+        symbol: LanguageServerSymbol,
+        member_kind: str,
+        member_name: str,
+        relative_path: str,
+        refs: list[ReferenceInLanguageServerSymbol],
+    ) -> tuple[dict[str, object], bool]:
+        """
+        Build the synthetic member root + grouped/deduped/sorted children (SPEC §4.3, points 2-6).
+        :return: (root node dict, truncated flag)
+        """
+        is_event = symbol.symbol_kind == SymbolKind.Event
+
+        # 1) dedup identical sites (relative_path, line, character); 2) group by containing-symbol identity.
+        seen_sites: set[tuple[str, int, int]] = set()
+        groups: dict[object, tuple[LanguageServerSymbol, list[tuple[str, int, int]]]] = {}
+        group_order: list[object] = []
+
+        for ref in refs:
+            containing = ref.symbol
+            site_rel_path = self._member_location_relative_path(containing, relative_path)
+            site_key = (site_rel_path, ref.line, ref.character)
+            if site_key in seen_sites:
+                continue
+            seen_sites.add(site_key)
+
+            group_key = self._member_group_key(containing)
+            if group_key not in groups:
+                groups[group_key] = (containing, [])
+                group_order.append(group_key)
+            groups[group_key][1].append(site_key)
+
+        # 3) sort sites within each group and build lightweight (first_site, group_key) descriptors;
+        #    sort groups deterministically and apply the node budget BEFORE any file reads/classification,
+        #    so a symbol referenced by thousands of containers does not read+classify all of them just to
+        #    discard the overflow.
+        descriptors: list[tuple[tuple[str, int, int], object]] = []
+        for group_key in group_order:
+            _, sites = groups[group_key]
+            sites.sort(key=lambda s: (s[1], s[2]))
+            descriptors.append((sites[0], group_key))
+        descriptors.sort(key=lambda d: d[0])
+        truncated = len(descriptors) > MEMBER_MAX_NODES
+        retained = descriptors[:MEMBER_MAX_NODES]
+
+        # 4) classify sites (reading source lines) for the RETAINED groups only.
+        file_lines_cache: dict[str, list[str] | None] = {}
+
+        def get_line_text(rel_path: str, line: int) -> str | None:
+            if rel_path not in file_lines_cache:
+                try:
+                    file_lines_cache[rel_path] = self.project.read_file(rel_path).split("\n")
+                except Exception:
+                    file_lines_cache[rel_path] = None
+            lines = file_lines_cache[rel_path]
+            if lines is None or not (0 <= line < len(lines)):
+                return None
+            return lines[line]
+
+        children: list[dict[str, object]] = []
+        for first_site, group_key in retained:
+            containing, sites = groups[group_key]
+            ranges: list[dict[str, object]] = []
+            for site_rel_path, site_line, site_char in sites:
+                line_text = get_line_text(site_rel_path, site_line)
+                if line_text is not None:
+                    access_kind = classify_member_access(line_text, site_char, member_name, is_event)
+                else:
+                    access_kind = "unknown"
+                ranges.append(
+                    {
+                        "start": {"line": site_line, "character": site_char},
+                        "end": {"line": site_line, "character": site_char + len(member_name)},
+                        "access_kind": access_kind,
+                    }
+                )
+
+            child_rel_path = first_site[0]
+            children.append(
+                {
+                    "name": self._member_symbol_name(containing, member_name),
+                    "kind": self._member_kind_name(containing),
+                    "relative_path": child_rel_path,
+                    "line": self._member_location_line(containing, first_site[1]),
+                    "call_sites": {"relative_path": child_rel_path, "ranges": ranges},
+                    "children": [],
+                }
+            )
+
+        # 6) synthetic root = the queried member itself.
+        root: dict[str, object] = {
+            "name": member_name,
+            "kind": member_kind,
+            "relative_path": self._member_location_relative_path(symbol, relative_path),
+            "line": self._member_location_line(symbol, 0),
+            "children": children,
+        }
+        return root, truncated
+
+    @staticmethod
+    def _member_kind_name(sym: object) -> str:
+        """Robustly resolve a `LanguageServerSymbol`-like object's symbol-kind name.
+
+        Prefers the real `symbol_kind_name` property (already the enum name); falls back to wrapping
+        `symbol_kind` in `SymbolKind(...)` (covers both raw ints and mocked test doubles that only set
+        `.symbol_kind`, not `.symbol_kind_name`).
+        """
+        kind_name = getattr(sym, "symbol_kind_name", None)
+        if isinstance(kind_name, str):
+            return kind_name
+        try:
+            return SymbolKind(getattr(sym, "symbol_kind", None)).name
+        except Exception:
+            return "Unknown"
+
+    @staticmethod
+    def _member_symbol_name(sym: object, default: str) -> str:
+        """Robustly resolve a `LanguageServerSymbol`-like object's unqualified name.
+
+        Prefers the real `.name` property; falls back to the last name-path component (from
+        `get_name_path()` when callable, else `default`, e.g. `resolved_name`) for test doubles that
+        only stub `get_name_path()`.
+        """
+        name = getattr(sym, "name", None)
+        if isinstance(name, str):
+            return name
+        get_name_path = getattr(sym, "get_name_path", None)
+        if callable(get_name_path):
+            try:
+                name_path = get_name_path()
+            except Exception:
+                name_path = None
+            if isinstance(name_path, str) and name_path:
+                return name_path.rsplit("/", 1)[-1]
+        return default.rsplit("/", 1)[-1]
+
+    @staticmethod
+    def _member_location_relative_path(sym: object, default: str) -> str:
+        """Robustly resolve a `LanguageServerSymbol`-like object's file path, falling back to `default`
+        (the relative_path the tool was invoked with) when `.location` is not a real
+        `LanguageServerSymbolLocation` (e.g. an unconfigured mock in tests).
+        """
+        location = getattr(sym, "location", None)
+        if isinstance(location, LanguageServerSymbolLocation) and isinstance(location.relative_path, str):
+            return location.relative_path
+        return default
+
+    @staticmethod
+    def _member_location_line(sym: object, default: int) -> int:
+        """Robustly resolve a `LanguageServerSymbol`-like object's identifier line, falling back to
+        `default` when `.location` is not a real `LanguageServerSymbolLocation`.
+        """
+        location = getattr(sym, "location", None)
+        if isinstance(location, LanguageServerSymbolLocation) and isinstance(location.line, int):
+            return location.line
+        return default
+
+    @staticmethod
+    def _member_group_key(sym: object) -> tuple[object, ...]:
+        """Grouping key for containing-symbol identity (SPEC §4.3.2): the containing symbol's own
+        location + kind when it is a real, positioned `LanguageServerSymbolLocation`; otherwise the
+        object's identity (safe fallback for test doubles whose `.location` is not configured).
+        """
+        location = getattr(sym, "location", None)
+        if (
+            isinstance(location, LanguageServerSymbolLocation)
+            and isinstance(location.relative_path, str)
+            and isinstance(location.line, int)
+        ):
+            return ("loc", location.relative_path, location.line, location.column, getattr(sym, "symbol_kind", None))
+        return ("id", id(sym))
 
     @staticmethod
     def _count_nodes(node: ls_types.CallHierarchyNode) -> int:
