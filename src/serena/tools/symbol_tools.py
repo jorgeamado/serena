@@ -756,6 +756,8 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
         """
         Finds callers (incoming) and/or callees (outgoing) of a function or method,
         transitively up to a given depth, using the language server's call hierarchy.
+        When the language server does not support call hierarchy, incoming calls are automatically derived from find-references,
+        which may include non-call usages and may miss callers inside properties, constructors, or one-line functions.
 
         :param name_path: name path of the symbol
         :param relative_path: the relative path to the file containing the symbol
@@ -792,19 +794,24 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
             )
 
         if direction in ("outgoing", "both"):
-            remaining_nodes = max_nodes_per_direction
-            if direction == "both" and result_incoming is not None:
-                remaining_nodes -= sum(self._count_nodes(node) for node in result_incoming["roots"])
-            if remaining_nodes > 0:
-                result_outgoing = symbol_retriever.request_call_hierarchy_by_location(
-                    symbol.location,
-                    direction="outgoing",
-                    depth=depth,
-                    max_nodes=remaining_nodes,
-                )
+            # Skip outgoing request if this is a "both" direction with approximate incoming
+            if direction == "both" and result_incoming is not None and result_incoming.get("approximate"):
+                # Approximate incoming: do not issue outgoing request
+                result_outgoing = None
             else:
-                # shared budget exhausted by the incoming direction: no request is made
-                result_outgoing = ls_types.CallHierarchyResult(roots=[], truncated=True, external_calls_omitted=0)
+                remaining_nodes = max_nodes_per_direction
+                if direction == "both" and result_incoming is not None:
+                    remaining_nodes -= sum(self._count_nodes(node) for node in result_incoming["roots"])
+                if remaining_nodes > 0:
+                    result_outgoing = symbol_retriever.request_call_hierarchy_by_location(
+                        symbol.location,
+                        direction="outgoing",
+                        depth=depth,
+                        max_nodes=remaining_nodes,
+                    )
+                else:
+                    # shared budget exhausted by the incoming direction: no request is made
+                    result_outgoing = ls_types.CallHierarchyResult(roots=[], truncated=True, external_calls_omitted=0)
 
         # empty prepare on a supported server: distinct message, never an empty-but-plausible result (spec §3.3)
         requested_results = [r for r in (result_incoming, result_outgoing) if r is not None]
@@ -823,6 +830,17 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
         if result_outgoing is not None:
             output["outgoing"] = self._hierarchy_to_json_list(result_outgoing["roots"])
 
+        # Handle approximate incoming (fallback from find-references)
+        if result_incoming is not None and result_incoming.get("approximate"):
+            ls_id = symbol_retriever.get_language_server(relative_path).ls_id.value
+            approximate_note = f"{ls_id} has no call hierarchy support; incoming calls were derived from find-references: they may include non-call usages and may miss callers inside properties, constructors or one-line functions."
+            output["approximate"] = True
+            output["approximate_note"] = approximate_note
+            # For direction=="both", suppress outgoing request and set unavailable message
+            if direction == "both":
+                output["outgoing"] = []
+                output["outgoing_unavailable"] = "outgoing calls cannot be derived from find-references"
+
         # combine truncated and external_calls_omitted
         truncated = False
         external_calls_omitted = 0
@@ -836,7 +854,7 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
         output["truncated"] = truncated
         output["external_calls_omitted"] = external_calls_omitted
 
-        # shortening factories
+        # shortening factories; all forms preserve the approximate/outgoing_unavailable warnings
         def make_tree_without_call_sites() -> str:
             """Tree without call_sites for each node"""
             result_copy = copy.deepcopy(output)
@@ -856,6 +874,12 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
                         counts_by_direction[direction_key] = dict(file_counts)
             summary = {"symbol": resolved_name, "direction": direction}
             summary.update(counts_by_direction)
+            # Add approximate fields if present
+            if "approximate" in output:
+                summary["approximate"] = output["approximate"]
+                summary["approximate_note"] = output["approximate_note"]
+            if "outgoing_unavailable" in output:
+                summary["outgoing_unavailable"] = output["outgoing_unavailable"]
             return f"Call hierarchy summary (counts per file):\n{self._to_json(summary)}"
 
         def make_summary() -> str:
@@ -865,7 +889,13 @@ class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
                 parts.append(f"{sum(self._count_nodes(n) for n in result_incoming['roots'])} incoming node(s)")
             if result_outgoing is not None:
                 parts.append(f"{sum(self._count_nodes(n) for n in result_outgoing['roots'])} outgoing node(s)")
-            return f"Call hierarchy for {resolved_name}: {', '.join(parts)}; truncated={truncated}"
+            summary_text = f"Call hierarchy for {resolved_name}: {', '.join(parts)}; truncated={truncated}"
+            # Append approximate note if present
+            if "approximate" in output:
+                summary_text += f" [approximate: {output['approximate_note']}]"
+            if "outgoing_unavailable" in output:
+                summary_text += f"; outgoing unavailable: {output['outgoing_unavailable']}"
+            return summary_text
 
         shortened_results = [make_tree_without_call_sites, make_per_file_counts, make_summary]
 

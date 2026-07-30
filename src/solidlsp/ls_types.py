@@ -454,11 +454,21 @@ class CallHierarchyNode(TypedDict):
 
 
 class CallHierarchyResult(TypedDict):
-    """Result of a call hierarchy request."""
+    """Result of a call hierarchy request.
+
+    When the language server does not support call hierarchy, incoming calls are approximated
+    via find-references. Approximate results carry the `approximate` flag and have known limitations:
+    they may include non-call usages (false positives) and may miss callers inside properties,
+    constructors, or one-line functions (false negatives). The `external_calls_omitted` count is
+    a lower bound in approximate mode, as reference normalization silently discards cross-drive
+    and nonexistent external locations before the fallback sees them.
+    """
 
     roots: list[CallHierarchyNode]
     """ The root nodes of the call hierarchy. """
     truncated: bool
     """ Whether the result was truncated due to node budget or deadline. """
     external_calls_omitted: int
-    """ Number of external calls that were omitted. """
+    """ Number of external calls that were omitted. In approximate mode, this is a lower bound. """
+    approximate: NotRequired[bool]
+    """ True if the result was derived from find-references instead of native call hierarchy support. """

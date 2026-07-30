@@ -127,7 +127,26 @@ class TestCallHierarchyPython:
         assert params["capabilities"]["textDocument"]["callHierarchy"] == {"dynamicRegistration": False}
 
     @pytest.mark.parametrize("language_server", UNSUPPORTED_BACKENDS, indirect=True)
-    def test_l8_unsupported_backend_raises(self, language_server: SolidLanguageServer) -> None:
-        """L8: backends without call hierarchy support raise a descriptive SolidLSPException."""
+    def test_f6_ty_incoming_with_fallback(self, language_server: SolidLanguageServer) -> None:
+        """F6: ty, incoming of leaf at depth=1, falls back to reference-based; approximate True; mid among callers."""
+        result = language_server.request_call_hierarchy(CALL_GRAPH_FILE, *LEAF_POS, direction="incoming", depth=1, max_nodes=200)
+
+        # Should NOT raise; should return a result
+        assert isinstance(result, dict)
+        assert len(result["roots"]) == 1
+        root = result["roots"][0]
+        assert root["name"] == "leaf"
+
+        # Should have approximate flag
+        assert result.get("approximate") is True
+
+        # Should have mid among callers (from fallback reference-based expansion)
+        children = root["children"]
+        child_names = [child["name"] for child in children]
+        assert "mid" in child_names
+
+    @pytest.mark.parametrize("language_server", UNSUPPORTED_BACKENDS, indirect=True)
+    def test_f7_ty_outgoing_raises(self, language_server: SolidLanguageServer) -> None:
+        """F7: ty, outgoing of mid, still raises (fallback not used for outgoing)."""
         with pytest.raises(SolidLSPException, match="does not support call hierarchy"):
-            language_server.request_call_hierarchy(CALL_GRAPH_FILE, *LEAF_POS, direction="incoming", depth=1, max_nodes=200)
+            language_server.request_call_hierarchy(CALL_GRAPH_FILE, *MID_POS, direction="outgoing", depth=1, max_nodes=200)
