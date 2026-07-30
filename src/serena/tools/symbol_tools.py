@@ -6,7 +6,7 @@ import copy
 import os
 from collections import Counter, defaultdict
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 from serena.symbol import LanguageServerSymbol, LanguageServerSymbolDictGrouper
 from serena.tools import (
@@ -16,9 +16,10 @@ from serena.tools import (
     ToolMarkerSymbolicEdit,
     ToolMarkerSymbolicRead,
 )
-from serena.tools.tools_base import ToolMarkerOptional
+from serena.tools.tools_base import ToolMarkerBeta, ToolMarkerOptional
 from serena.util.ls_diagnostics import GroupedDiagnostics
 from serena.util.text_utils import find_text_coordinates
+from solidlsp import ls_types
 from solidlsp.ls_types import SymbolKind
 
 
@@ -736,3 +737,218 @@ class SafeDeleteSymbol(Tool, ToolMarkerSymbolicEdit):
         code_editor = self.create_ls_code_editor()
         code_editor.delete_symbol(symbol_name_path, relative_file_path=symbol_rel_path)
         return SUCCESS_RESULT
+
+
+class CallHierarchyTool(Tool, ToolMarkerSymbolicRead, ToolMarkerBeta):
+    """
+    Finds callers (incoming) and/or callees (outgoing) of a function or method,
+    transitively up to a given depth, using the language server's call hierarchy.
+    """
+
+    def apply(
+        self,
+        name_path: str,
+        relative_path: str,
+        direction: str = "incoming",
+        depth: int = 1,
+        max_answer_chars: int = -1,
+    ) -> str:
+        """
+        Finds callers (incoming) and/or callees (outgoing) of a function or method,
+        transitively up to a given depth, using the language server's call hierarchy.
+        When the language server does not support call hierarchy, incoming calls are automatically derived from find-references,
+        which may include non-call usages and may miss callers inside properties, constructors, or one-line functions.
+
+        :param name_path: name path of the symbol
+        :param relative_path: the relative path to the file containing the symbol
+        :param direction: "incoming" (who calls this), "outgoing" (what this calls), or "both"
+        :param depth: maximum depth to expand (1-10); default 1
+        :param max_answer_chars: max result length; -1 for default
+        :return: JSON with incoming/outgoing call hierarchies
+        """
+        # validate direction
+        if direction not in ("incoming", "outgoing", "both"):
+            raise ValueError(f'direction must be "incoming", "outgoing", or "both", got "{direction}"')
+
+        # validate depth
+        if depth < 1 or depth > 10:
+            raise ValueError(f"depth must be between 1 and 10, got {depth}")
+
+        # sync file system before any LS call
+        if relative_path:
+            self.project.ls_sync_file_system_changes()
+
+        # resolve symbol via retriever
+        symbol_retriever = self.create_language_server_symbol_retriever()
+        symbol = symbol_retriever.find_unique(name_path, substring_matching=False, within_relative_path=relative_path)
+        resolved_name = symbol.get_name_path()
+
+        # request call hierarchy
+        max_nodes_per_direction = 200  # CALL_HIERARCHY_MAX_NODES
+        result_incoming: ls_types.CallHierarchyResult | None = None
+        result_outgoing: ls_types.CallHierarchyResult | None = None
+
+        if direction in ("incoming", "both"):
+            result_incoming = symbol_retriever.request_call_hierarchy_by_location(
+                symbol.location, direction="incoming", depth=depth, max_nodes=max_nodes_per_direction
+            )
+
+        if direction in ("outgoing", "both"):
+            # Skip outgoing request if this is a "both" direction with approximate incoming
+            if direction == "both" and result_incoming is not None and result_incoming.get("approximate"):
+                # Approximate incoming: do not issue outgoing request
+                result_outgoing = None
+            else:
+                remaining_nodes = max_nodes_per_direction
+                if direction == "both" and result_incoming is not None:
+                    remaining_nodes -= sum(self._count_nodes(node) for node in result_incoming["roots"])
+                if remaining_nodes > 0:
+                    result_outgoing = symbol_retriever.request_call_hierarchy_by_location(
+                        symbol.location,
+                        direction="outgoing",
+                        depth=depth,
+                        max_nodes=remaining_nodes,
+                    )
+                else:
+                    # shared budget exhausted by the incoming direction: no request is made
+                    result_outgoing = ls_types.CallHierarchyResult(roots=[], truncated=True, external_calls_omitted=0)
+
+        # empty prepare on a supported server: distinct message, never an empty-but-plausible result (spec §3.3)
+        requested_results = [r for r in (result_incoming, result_outgoing) if r is not None]
+        if all(not r["roots"] and not r["truncated"] and r["external_calls_omitted"] == 0 for r in requested_results):
+            return "No callable symbol found at the given position"
+
+        # build output; every requested direction key is always present
+        output: dict[str, object] = {
+            "symbol": resolved_name,
+            "direction": direction,
+        }
+
+        if result_incoming is not None:
+            output["incoming"] = self._hierarchy_to_json_list(result_incoming["roots"])
+
+        if result_outgoing is not None:
+            output["outgoing"] = self._hierarchy_to_json_list(result_outgoing["roots"])
+
+        # Handle approximate incoming (fallback from find-references)
+        if result_incoming is not None and result_incoming.get("approximate"):
+            ls_id = symbol_retriever.get_language_server(relative_path).ls_id.value
+            approximate_note = f"{ls_id} has no call hierarchy support; incoming calls were derived from find-references: they may include non-call usages and may miss callers inside properties, constructors or one-line functions."
+            output["approximate"] = True
+            output["approximate_note"] = approximate_note
+            # For direction=="both", suppress outgoing request and set unavailable message
+            if direction == "both":
+                output["outgoing"] = []
+                output["outgoing_unavailable"] = "outgoing calls cannot be derived from find-references"
+
+        # combine truncated and external_calls_omitted
+        truncated = False
+        external_calls_omitted = 0
+        if result_incoming:
+            truncated = truncated or result_incoming["truncated"]
+            external_calls_omitted += result_incoming["external_calls_omitted"]
+        if result_outgoing:
+            truncated = truncated or result_outgoing["truncated"]
+            external_calls_omitted += result_outgoing["external_calls_omitted"]
+
+        output["truncated"] = truncated
+        output["external_calls_omitted"] = external_calls_omitted
+
+        # shortening factories; all forms preserve the approximate/outgoing_unavailable warnings
+        def make_tree_without_call_sites() -> str:
+            """Tree without call_sites for each node"""
+            result_copy = copy.deepcopy(output)
+            for direction_key in ("incoming", "outgoing"):
+                if direction_key in result_copy:
+                    self._remove_call_sites(cast(list[dict[str, object]], result_copy[direction_key]))
+            return f"Call hierarchy (without call site details):\n{self._to_json(result_copy)}"
+
+        def make_per_file_counts() -> str:
+            """Per-file counts of incoming/outgoing calls"""
+            counts_by_direction: dict[str, dict[str, int]] = {}
+            for direction_key in ("incoming", "outgoing"):
+                if direction_key in output:
+                    file_counts: dict[str, int] = defaultdict(int)
+                    self._count_nodes_by_file(cast(list[dict[str, object]], output[direction_key]), file_counts)
+                    if file_counts:
+                        counts_by_direction[direction_key] = dict(file_counts)
+            summary = {"symbol": resolved_name, "direction": direction}
+            summary.update(counts_by_direction)
+            # Add approximate fields if present
+            if "approximate" in output:
+                summary["approximate"] = output["approximate"]
+                summary["approximate_note"] = output["approximate_note"]
+            if "outgoing_unavailable" in output:
+                summary["outgoing_unavailable"] = output["outgoing_unavailable"]
+            return f"Call hierarchy summary (counts per file):\n{self._to_json(summary)}"
+
+        def make_summary() -> str:
+            """One-line summary with total counts"""
+            parts = []
+            if result_incoming is not None:
+                parts.append(f"{sum(self._count_nodes(n) for n in result_incoming['roots'])} incoming node(s)")
+            if result_outgoing is not None:
+                parts.append(f"{sum(self._count_nodes(n) for n in result_outgoing['roots'])} outgoing node(s)")
+            summary_text = f"Call hierarchy for {resolved_name}: {', '.join(parts)}; truncated={truncated}"
+            # Append approximate note if present
+            if "approximate" in output:
+                summary_text += f" [approximate: {output['approximate_note']}]"
+            if "outgoing_unavailable" in output:
+                summary_text += f"; outgoing unavailable: {output['outgoing_unavailable']}"
+            return summary_text
+
+        shortened_results = [make_tree_without_call_sites, make_per_file_counts, make_summary]
+
+        result_json = self._to_json(output)
+        return self._limit_length(result_json, max_answer_chars, shortened_result_factories=shortened_results)
+
+    @staticmethod
+    def _count_nodes(node: ls_types.CallHierarchyNode) -> int:
+        """Count total nodes in a subtree."""
+        count = 1
+        for child in node.get("children", []):
+            count += CallHierarchyTool._count_nodes(child)
+        return count
+
+    @staticmethod
+    def _hierarchy_to_json_list(nodes: list[ls_types.CallHierarchyNode]) -> list[dict[str, object]]:
+        """Convert hierarchy nodes to JSON-compatible dicts."""
+        result = []
+        for node in nodes:
+            node_dict: dict[str, object] = {
+                "name": node["name"],
+                "kind": SymbolKind(node["kind"]).name,  # render as enum name
+                "relative_path": node["location"]["relativePath"],
+                "line": node["location"]["range"]["start"]["line"],  # line from location
+            }
+            if "detail" in node:
+                node_dict["detail"] = node["detail"]
+            if "call_sites" in node:
+                node_dict["call_sites"] = node["call_sites"]
+            if "recursion" in node:
+                node_dict["recursion"] = node["recursion"]
+            if node.get("children"):
+                node_dict["children"] = CallHierarchyTool._hierarchy_to_json_list(node["children"])
+            else:
+                node_dict["children"] = []
+            result.append(node_dict)
+        return result
+
+    @staticmethod
+    def _remove_call_sites(nodes: list[dict[str, object]]) -> None:
+        """Recursively remove call_sites from all nodes in-place."""
+        for node in nodes:
+            if "call_sites" in node:
+                del node["call_sites"]
+            if "children" in node and isinstance(node["children"], list):
+                CallHierarchyTool._remove_call_sites(cast(list[dict[str, object]], node["children"]))
+
+    @staticmethod
+    def _count_nodes_by_file(nodes: list[dict[str, object]], file_counts: dict[str, int]) -> None:
+        """Recursively count nodes by file."""
+        for node in nodes:
+            rel_path = node.get("relative_path", "unknown")
+            if isinstance(rel_path, str):
+                file_counts[rel_path] = file_counts.get(rel_path, 0) + 1
+            if "children" in node and isinstance(node["children"], list):
+                CallHierarchyTool._count_nodes_by_file(cast(list[dict[str, object]], node["children"]), file_counts)

@@ -1,6 +1,7 @@
 description: JetBrains tools replace language server-based tools
 prompt:
 excluded_tools:
+  - call_hierarchy
   - find_symbol
   - find_referencing_symbols
   - get_symbols_overview

@@ -86,6 +86,12 @@ FORMATTING_TAB_SIZE = 4
 FORMATTING_INSERT_SPACES = True
 """Whether to prefer spaces over tabs, sent as part of the `options` of a `textDocument/formatting` request."""
 
+CALL_HIERARCHY_MAX_NODES = 200
+"""Hard cap on total emitted nodes in a call hierarchy result."""
+
+CALL_HIERARCHY_DEADLINE_SECONDS = 30
+"""Cooperative deadline for call hierarchy requests."""
+
 
 @dataclasses.dataclass(kw_only=True)
 class ReferenceInSymbol:
@@ -1690,6 +1696,528 @@ class SolidLanguageServer(ABC):
         """
         request = self.ReferencesLocationRequest(self, relative_file_path, line, column)
         return request.execute()
+
+    def request_call_hierarchy(
+        self, relative_file_path: str, line: int, column: int, direction: str, depth: int, max_nodes: int
+    ) -> ls_types.CallHierarchyResult:
+        """
+        Request call hierarchy for a symbol at the given position.
+
+        :param relative_file_path: The relative path of the file containing the symbol
+        :param line: The line number of the symbol
+        :param column: The column number of the symbol
+        :param direction: "incoming" | "outgoing" (specifies which direction to expand)
+        :param depth: The maximum depth to expand the hierarchy
+        :param max_nodes: The maximum number of nodes to emit
+        :return: CallHierarchyResult containing the hierarchy tree
+        """
+        if direction not in ("incoming", "outgoing"):
+            raise ValueError(f'direction must be "incoming" or "outgoing", got "{direction}"')
+
+        # ensure server started
+        if not self.server_started:
+            log.error("request_call_hierarchy called before language server started")
+            raise SolidLSPException("Language Server not started")
+
+        # the cooperative deadline covers prepare as well as the expansion
+        deadline = monotonic() + CALL_HIERARCHY_DEADLINE_SECONDS
+
+        # arm indexing tracking before didOpen
+        self._pre_open_for_cross_file_references()
+
+        with self.open_file(relative_file_path):
+            self._wait_for_cross_file_references_if_needed()
+
+            # prepare call hierarchy (with fallback for -32601 incoming)
+            prepare_items: list[dict[str, object]] = []
+            use_fallback = False
+
+            try:
+                params = self._create_text_document_position_params(relative_file_path, line, column)
+                prepare_response = self.server.send.prepare_call_hierarchy(params)
+                prepare_items = cast(list[dict[str, object]], prepare_response if prepare_response is not None else [])
+            except Exception as e:
+                # check if this is a -32601 for incoming; if so, run fallback
+                if direction == "incoming" and self._is_unsupported_error(e):
+                    use_fallback = True
+                else:
+                    # non-fallback errors: map and raise
+                    mapped_exception = self._map_call_hierarchy_exception(e, "textDocument/prepareCallHierarchy")
+                    if mapped_exception is not None:
+                        raise mapped_exception from e
+                    raise
+
+            # fallback path (only for incoming -32601)
+            if use_fallback:
+                return self._call_hierarchy_fallback_incoming(relative_file_path, line, column, depth, max_nodes, deadline)
+
+            # standard path (prepare succeeded)
+            # perform expansion
+            def fetch_calls(item: dict[str, object]) -> list[dict[str, object]]:
+                """Fetch the appropriate calls (incoming or outgoing) for an item."""
+                method_name = "callHierarchy/incomingCalls" if direction == "incoming" else "callHierarchy/outgoingCalls"
+                try:
+                    if direction == "incoming":
+                        result = self.server.send.incoming_calls(cast(lsp_types.CallHierarchyIncomingCallsParams, {"item": item}))
+                    else:  # direction == "outgoing"
+                        result = self.server.send.outgoing_calls(cast(lsp_types.CallHierarchyOutgoingCallsParams, {"item": item}))
+                except Exception as e:
+                    mapped_exception = self._map_call_hierarchy_exception(e, method_name)
+                    if mapped_exception is not None:
+                        raise mapped_exception from e
+                    raise
+
+                return cast(list[dict[str, object]], result if result is not None else [])
+
+            result = self._expand_call_hierarchy(
+                prepare_items=prepare_items,
+                fetch_calls=fetch_calls,
+                convert_item=self._convert_call_hierarchy_item,
+                direction=direction,
+                depth=depth,
+                max_nodes=max_nodes,
+                deadline=deadline,
+            )
+
+            return result
+
+    def _call_hierarchy_item_from_symbol(self, symbol: ls_types.UnifiedSymbolInformation) -> dict[str, object] | None:
+        """
+        Convert a UnifiedSymbolInformation to a call hierarchy item dict.
+
+        :param symbol: The symbol to convert
+        :return: A dict with the item's shape, or None if the symbol lacks location/range/uri
+        """
+        if "location" not in symbol:
+            return None
+
+        location = symbol["location"]
+        if "range" not in location or "uri" not in location:
+            return None
+
+        uri = location["uri"]
+        range_val = location["range"]
+
+        # selectionRange defaults to the location's range if not present
+        selection_range = symbol.get("selectionRange") or range_val
+
+        # build the call hierarchy item in LSP shape
+        item: dict[str, object] = {
+            "name": symbol.get("name", ""),
+            "kind": symbol.get("kind", 1),
+            "uri": uri,
+            "range": range_val,
+            "selectionRange": selection_range,
+            "data": None,
+        }
+
+        if "detail" in symbol:
+            item["detail"] = symbol["detail"]
+
+        return item
+
+    def _fetch_incoming_calls_via_references(
+        self, item: dict[str, object], deadline: float, max_callers: int
+    ) -> tuple[list[dict[str, object]], bool]:
+        """
+        Fetch incoming callers for an item by searching for references.
+
+        :param item: The call hierarchy item (pseudo-item from _call_hierarchy_item_from_symbol)
+        :param deadline: Monotonic time deadline; stop processing if exceeded
+        :param max_callers: Maximum distinct callers to return; stop processing if exceeded
+        :return: (calls, dropped) where calls is [{"from": <pseudo-item>, "fromRanges": [...]}]
+                 and dropped=True if deadline/max_callers bound terminated processing early
+        """
+        uri = cast(str, item.get("uri", ""))
+        selection_range = cast(dict[str, object], item.get("selectionRange", {}))
+        start_pos = cast(dict[str, int], selection_range.get("start", {}))
+
+        # derive (relative_path, line, column) from pseudo-item
+        abs_path = PathUtils.uri_to_path(uri)
+        rel_path = PathUtils.get_relative_path(abs_path, self.repository_root_path)
+        if rel_path is None:
+            return ([], False)
+
+        line = start_pos.get("line", 0)
+        column = start_pos.get("character", 0)
+
+        # request references (without imports, self, body, file_symbols per spec §3);
+        # errors are explicit, never silently swallowed — a failing reference search must not
+        # masquerade as "no callers"
+        references = self.request_referencing_symbols(
+            rel_path,
+            line,
+            column,
+            include_imports=False,
+            include_self=False,
+            include_body=False,
+            include_file_symbols=False,
+        )
+
+        dropped = False
+        seen_callers: dict[tuple[str, int, int], tuple[ls_types.UnifiedSymbolInformation, list[ls_types.Range]]] = {}
+
+        # process references and group by caller
+        for ref in references:
+            # check deadline
+            if monotonic() > deadline:
+                dropped = True
+                break
+
+            # check max_callers bound
+            if len(seen_callers) >= max_callers:
+                dropped = True
+                break
+
+            symbol = ref.symbol
+            ref_line = ref.line
+            ref_char = ref.character
+
+            # kind filter: only Method/Function (by enum name)
+            kind = symbol.get("kind")
+            if kind not in (lsp_types.SymbolKind.Method, lsp_types.SymbolKind.Function):
+                continue
+
+            # extract the enclosing symbol key
+            if "location" not in symbol or "selectionRange" not in symbol:
+                continue
+
+            sym_location = symbol["location"]
+            sym_selection = symbol.get("selectionRange")
+            if sym_selection is None:
+                continue
+
+            sym_start = cast(dict[str, int], sym_selection.get("start", {}))
+            caller_uri = sym_location.get("uri", "")
+            caller_line = sym_start.get("line", 0)
+            caller_char = sym_start.get("character", 0)
+            caller_key = (caller_uri, caller_line, caller_char)
+
+            # create zero-width range for this reference location
+            ref_range: ls_types.Range = {
+                "start": {"line": ref_line, "character": ref_char},
+                "end": {"line": ref_line, "character": ref_char},
+            }
+
+            if caller_key not in seen_callers:
+                # the enclosing symbol is already resolved by request_referencing_symbols —
+                # no re-fetch via request_containing_symbol
+                seen_callers[caller_key] = (symbol, [])
+
+            seen_callers[caller_key][1].append(ref_range)
+
+        # convert grouped callers to call items with pseudo-items
+        calls: list[dict[str, object]] = []
+        for caller_symbol, from_ranges in seen_callers.values():
+            pseudo_item = self._call_hierarchy_item_from_symbol(caller_symbol)
+            if pseudo_item is None:
+                # sanctioned silent drop (spec §3): symbol lacks a usable location
+                continue
+
+            calls.append({"from": pseudo_item, "fromRanges": from_ranges})
+
+        return (calls, dropped)
+
+    def _is_unsupported_error(self, error: Exception) -> bool:
+        """
+        Check if an exception represents a -32601 (unsupported) LSP error.
+
+        :param error: The exception to check
+        :return: True if the exception is a -32601 error
+        """
+        lsp_error: Exception | None = error
+        if isinstance(error, SolidLSPException):
+            lsp_error = error.cause
+        if isinstance(lsp_error, LSPError) and getattr(lsp_error, "code", None) == -32601:
+            return True
+        return False
+
+    def _call_hierarchy_fallback_incoming(
+        self, relative_file_path: str, line: int, column: int, depth: int, max_nodes: int, deadline: float
+    ) -> ls_types.CallHierarchyResult:
+        """
+        Fallback for incoming call hierarchy when the server returns -32601 (unsupported).
+        Derives incoming calls via find-references instead.
+
+        :param relative_file_path: The relative path of the file containing the symbol
+        :param line: The line number of the symbol
+        :param column: The column number of the symbol
+        :param depth: The maximum depth to expand the hierarchy
+        :param max_nodes: The maximum number of nodes to emit
+        :param deadline: Time deadline for the expansion
+        :return: CallHierarchyResult with approximate=True
+        """
+        # step 1: get root symbol via request_containing_symbol
+        # errors are explicit: a failing symbol resolution must propagate, not masquerade
+        # as "no callable symbol" (only a None result means that)
+        root_symbol = self.request_containing_symbol(relative_file_path, line, column, include_body=False)
+
+        # reject non-Method/Function roots
+        if root_symbol is None:
+            return ls_types.CallHierarchyResult(roots=[], truncated=False, external_calls_omitted=0, approximate=True)
+
+        kind = root_symbol.get("kind")
+        if kind not in (lsp_types.SymbolKind.Method, lsp_types.SymbolKind.Function):
+            return ls_types.CallHierarchyResult(roots=[], truncated=False, external_calls_omitted=0, approximate=True)
+
+        # step 2: convert root symbol to pseudo-item
+        root_item = self._call_hierarchy_item_from_symbol(root_symbol)
+        if root_item is None:
+            return ls_types.CallHierarchyResult(roots=[], truncated=False, external_calls_omitted=0, approximate=True)
+
+        # step 3: set up expansion with reference-based fetch
+        # wrap the fetch to track dropped flags and pass the REMAINING budget, approximated
+        # by counting calls handed to the engine so far (each becomes at most one node)
+        fallback_truncated = False
+        nodes_handed_out = 1  # the root
+
+        def fetch_calls_fallback(item: dict[str, object]) -> list[dict[str, object]]:
+            """Fetch incoming calls via references."""
+            nonlocal fallback_truncated, nodes_handed_out
+
+            remaining = max(0, max_nodes - nodes_handed_out)
+            calls, dropped = self._fetch_incoming_calls_via_references(item, deadline, remaining)
+            if dropped:
+                fallback_truncated = True
+
+            nodes_handed_out += len(calls)
+            return calls
+
+        # perform expansion using the engine
+        result = self._expand_call_hierarchy(
+            prepare_items=[root_item],
+            fetch_calls=fetch_calls_fallback,
+            convert_item=self._convert_call_hierarchy_item,
+            direction="incoming",
+            depth=depth,
+            max_nodes=max_nodes,
+            deadline=deadline,
+        )
+
+        # mark result as approximate and merge dropped flag
+        result["approximate"] = True
+        result["truncated"] = result["truncated"] or fallback_truncated
+
+        return result
+
+    def _expand_call_hierarchy(
+        self,
+        prepare_items: list[dict[str, object]],
+        fetch_calls: Callable[[dict[str, object]], list[dict[str, object]]],
+        convert_item: Callable[[dict[str, object]], tuple[tuple[str, int, int], ls_types.CallHierarchyNode | None, bool]],
+        direction: str,
+        depth: int,
+        max_nodes: int,
+        deadline: float,
+    ) -> ls_types.CallHierarchyResult:
+        """
+        Expand a call hierarchy tree breadth-first.
+
+        :param prepare_items: The root items from prepareCallHierarchy
+        :param fetch_calls: Function to fetch calls (incoming or outgoing) for an item
+        :param convert_item: Function to convert an LSP item to a CallHierarchyNode
+        :param direction: "incoming" or "outgoing"
+        :param depth: Maximum depth to expand
+        :param max_nodes: Maximum number of nodes to emit
+        :param deadline: Time deadline for the expansion
+        :return: CallHierarchyResult
+        """
+        roots: list[ls_types.CallHierarchyNode] = []
+        truncated = False
+        external_calls_omitted = 0
+        emitted = 0
+
+        # convert prepare items to root nodes, build initial frontier
+        frontier: list[tuple[dict[str, object], ls_types.CallHierarchyNode, set[tuple[str, int, int]], int]] = []
+
+        for item in prepare_items:
+            if emitted >= max_nodes:
+                truncated = True
+                break
+
+            key, node, omitted = convert_item(item)
+            if omitted:
+                external_calls_omitted += 1
+            if node is not None:
+                roots.append(node)
+                emitted += 1
+                # the ancestor set covers the node itself plus all its ancestors, so a root starts with its own key;
+                # this makes direct self-recursion produce a stub at the first level
+                frontier.append((item, node, {key}, 0))
+
+        # breadth-first expansion
+        while frontier:
+            if monotonic() > deadline:
+                truncated = True
+                break
+
+            if emitted >= max_nodes:
+                truncated = True
+                break
+
+            next_frontier = []
+
+            for parent_item, parent_node, ancestor_keys, current_depth in frontier:
+                if emitted >= max_nodes:
+                    truncated = True
+                    break
+
+                # cooperative deadline: checked between requests, not only between levels
+                if monotonic() > deadline:
+                    truncated = True
+                    break
+
+                # stop at depth limit
+                if current_depth >= depth:
+                    continue
+
+                # fetch calls for this item; errors are explicit, never silently swallowed (spec §3.3)
+                calls = fetch_calls(parent_item)
+
+                # process each call
+                for call in calls:
+                    if emitted >= max_nodes:
+                        truncated = True
+                        break
+
+                    # extract item based on direction
+                    item = call.get("from") if direction == "incoming" else call.get("to")
+                    from_ranges = call.get("fromRanges", [])
+
+                    if item is None:
+                        continue
+
+                    key, child_node, omitted = convert_item(cast(dict[str, object], item))
+
+                    if omitted:
+                        external_calls_omitted += 1
+                        continue
+
+                    if child_node is None:
+                        continue
+
+                    # call_sites on every child (recursion stubs included; absence is reserved for roots):
+                    # for incoming, the ranges lie in the CHILD's (caller's) file; for outgoing, in the PARENT's file
+                    call_site_relative_path = (
+                        cast(str, child_node["location"]["relativePath"])
+                        if direction == "incoming"
+                        else cast(str, parent_node["location"]["relativePath"])
+                    )
+                    child_node["call_sites"] = {
+                        "relative_path": call_site_relative_path,
+                        "ranges": cast(list[ls_types.Range], from_ranges),
+                    }
+
+                    if key in ancestor_keys:
+                        # recursion stub: already on this path — emit but do not expand
+                        child_node["recursion"] = True
+                        child_node["children"] = []
+                        parent_node["children"].append(child_node)
+                        emitted += 1
+                    else:
+                        parent_node["children"].append(child_node)
+                        emitted += 1
+
+                        # enqueue for the next level only if it can actually be expanded (depth gate);
+                        # this keeps the frontier free of dead entries that would fake a truncation
+                        if current_depth + 1 < depth:
+                            new_ancestor_keys = ancestor_keys | {key}
+                            next_frontier.append((item, child_node, new_ancestor_keys, current_depth + 1))
+
+            frontier = next_frontier
+
+        return ls_types.CallHierarchyResult(
+            roots=roots,
+            truncated=truncated,
+            external_calls_omitted=external_calls_omitted,
+        )
+
+    def _convert_call_hierarchy_item(self, item: dict[str, object]) -> tuple[tuple[str, int, int], ls_types.CallHierarchyNode | None, bool]:
+        """
+        Convert an LSP CallHierarchyItem to our internal representation.
+
+        :param item: The LSP CallHierarchyItem
+        :return: (key, node|None, omitted) where key is (uri, line, char) for deduplication
+        """
+        uri = cast(str, item.get("uri", ""))
+        name = cast(str, item.get("name", ""))
+        kind = cast(int, item.get("kind", 1))
+        detail = item.get("detail")
+        selection_range = cast(dict[str, object], item.get("selectionRange", {}))
+
+        # extract key from uri and selection range start
+        start_pos = cast(dict[str, int], selection_range.get("start", {}))
+        key_line = start_pos.get("line", 0)
+        key_char = start_pos.get("character", 0)
+        key = (uri, key_line, key_char)
+
+        # convert URI to path
+        abs_path = PathUtils.uri_to_path(uri)
+
+        # containment check using Path.is_relative_to
+        try:
+            abs_path_resolved = Path(abs_path).resolve()
+            repo_root_resolved = Path(self.repository_root_path).resolve()
+            if not abs_path_resolved.is_relative_to(repo_root_resolved):
+                # outside repository
+                return (key, None, True)
+        except (ValueError, OSError):
+            # is_relative_to can raise ValueError on Windows with different drives
+            return (key, None, True)
+
+        # check if file exists
+        if not os.path.exists(abs_path):
+            log.info("_convert_call_hierarchy_item: symbol at non-existent path: %s", abs_path)
+            return (key, None, True)
+
+        # get relative path
+        rel_path = PathUtils.get_relative_path(abs_path, self.repository_root_path)
+        if rel_path is None:
+            return (key, None, True)
+
+        # check if ignored
+        if self.is_ignored_path(rel_path):
+            log.info("_convert_call_hierarchy_item: symbol in ignored path: %s", rel_path)
+            return (key, None, False)
+
+        # build location from selectionRange.start
+        location = ls_types.Location(
+            uri=uri,
+            range=cast(ls_types.Range, selection_range),
+            absolutePath=abs_path,
+            relativePath=rel_path,
+        )
+
+        # build node
+        node: ls_types.CallHierarchyNode = {
+            "name": name,
+            "kind": cast(lsp_types.SymbolKind, kind),
+            "location": location,
+            "children": [],
+        }
+
+        if detail is not None and isinstance(detail, str):
+            node["detail"] = detail
+
+        return (key, node, False)
+
+    def _map_call_hierarchy_exception(self, error: Exception, method_name: str) -> SolidLSPException | None:
+        """
+        Map LSP exceptions for call hierarchy requests.
+
+        :param error: The exception that occurred
+        :param method_name: The name of the method that failed
+        :return: A mapped exception or None if no mapping applies
+        """
+        # the transport raises SolidLSPException with the LSPError as its cause (ls_process.send_request);
+        # a bare LSPError is also handled in case a caller surfaces one directly
+        lsp_error: Exception | None = error
+        if isinstance(error, SolidLSPException):
+            lsp_error = error.cause
+        if isinstance(lsp_error, LSPError) and getattr(lsp_error, "code", None) == -32601:
+            ls_id = self.ls_id.value if hasattr(self.ls_id, "value") else str(self.ls_id)
+            return SolidLSPException(f"The {ls_id} language server does not support call hierarchy ({method_name} not implemented)")
+        return None
 
     def retrieve_full_file_content(self, file_path: str) -> str:
         """
