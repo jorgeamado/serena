@@ -2,6 +2,14 @@
 
 Status of the `main` branch. Changes prior to the next official version change will appear here.
 
+* Tools (fork additions, not part of upstream releases):
+  - Add `call_hierarchy`: find callers/callees transitively using the language server's call hierarchy; when the language server does not support call hierarchy, incoming calls fall back to find-references with an `approximate` flag and explanatory note. Supports property/field/event members (classified, approximate) and reports a position anchor (`relative_path:line:column`) for framework/external members
+  - Add `format_file` (beta): formats a whole file via the language server's `textDocument/formatting`
+    capability and writes the result to disk; reports honestly when the routed language server does
+    not support formatting (e.g. all currently supported Python language servers) instead of silently
+    doing nothing
+  - Add `unity_asset_references`: static Unity asset-reference search
+
 * General:
   - Fix: Parallel agents auto-registering projects could overwrite each other's changes to the global
     project list in `serena_config.yml`
@@ -60,11 +68,6 @@ Status of the `main` branch. Changes prior to the next official version change w
     - Disable symbol groupers, remove flawed pattern search test
 
 * Tools:
-  - Add `call_hierarchy`: find callers/callees transitively using the language server's call hierarchy; when the language server does not support call hierarchy, incoming calls fall back to find-references with an `approximate` flag and explanatory note
-  - Add `format_file` (beta): formats a whole file via the language server's `textDocument/formatting`
-    capability and writes the result to disk; reports honestly when the routed language server does
-    not support formatting (e.g. all currently supported Python language servers) instead of silently
-    doing nothing
   - `find_symbol`, `jet_brains_find_symbol`: Change tool description to improve tool search results in clients that load tools dynamically
   - `get_current_config`: Result now includes language server status #1782
   - More liberal handling of ignored paths in file access tools:
